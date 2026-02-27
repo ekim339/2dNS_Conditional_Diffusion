@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+env/
+ENV/
+.venv
+conda/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Machine Learning / Data Science
+# Checkpoint files (uncomment if you don't want to track checkpoints)
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.hdf5
+
+# Data files (uncomment if you don't want to track data)
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# Logs and outputs
+logs/
+*.log
+runs/
+wandb/
+tensorboard/
+
+# Model outputs
+outputs/
+results/
+checkpoint/
+checkpoints/
+ddpm_sparse_cfg/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+
+# other
+sub/
