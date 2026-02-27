@@ -159,7 +159,7 @@ def run_eval(ckpt_path: str, data_path: str, batch_size: int = 32, num_batches: 
     print(f"Test samples: {n_test} (20%)")
     print(f"Data shape: {data.shape}")
     
-    # Randomly sample 100 from train and 1000 from test
+    # Randomly sample 100 from train and 100 from test
     n_samples_per_split = 100
     np.random.seed(42)  # For reproducibility
     
@@ -324,7 +324,7 @@ if __name__ == "__main__":
     # This will create checkpoints in: /Users/eugenekim/2dNS_Conditional_Diffusion/checkpoint/
     
     # Default checkpoint path (created after training)
-    default_ckpt = "/Users/eugenekim/2dNS_Conditional_Diffusion/checkpoint/last.pt"
+    default_ckpt = "/Users/eugenekim/2dNS_Conditional_Diffusion/checkpoint/w=10p=0.1.pt"
     
     # Check if checkpoint exists, if not provide helpful message
     if not os.path.exists(default_ckpt):
@@ -345,5 +345,5 @@ if __name__ == "__main__":
         data_path="/Users/eugenekim/2dNS_Conditional_Diffusion/NSE_Data(Noisy).npy",
         batch_size=16,         # DDPM sampling is slow; start small
         num_batches=5,         # increase if you can afford it
-        guidance_scale=4.0,
+        guidance_scale=None,   # None = use checkpoint's guidance_scale, or set explicitly (e.g., 4.0)
     )
