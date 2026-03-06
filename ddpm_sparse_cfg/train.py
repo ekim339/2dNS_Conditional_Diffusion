@@ -13,7 +13,7 @@ if __name__ == "__main__":
 
     # example: load your dataset
     # replace this with your actual loading
-    NSE_data = np.load("content/drive/MyDrive/Lab/CondDiff/NSE_Data(Noisy).npy")
+    NSE_data = np.load("/content/drive/MyDrive/Lab/CondDiff/NSE_Data(Noisy).npy")
     print(NSE_data.shape)
 
     ckpt_path, stats, cfg = run_training(NSE_data)
