@@ -65,7 +65,6 @@ outputs/
 results/
 checkpoint/
 checkpoints/
-ddpm_sparse_cfg/
 
 # Temporary files
 *.tmp
