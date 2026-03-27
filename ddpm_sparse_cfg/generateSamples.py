@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from ConditionalDiffusion import (
+from cfgConditional import (
     ConditionalDDPM, DDPMTrainer, DiffusionConfig,
     default_device
 )
@@ -36,17 +36,17 @@ def generate_and_plot_sample(
     # Normalize
     x0_true_norm = (x0_true - mean) / (std + 1e-8)
     
-    # Build sparse observation y (8x8) - match dataset exactly
-    coords = torch.arange(0, 64, 8, dtype=torch.long)
+    # Build sparse observation y (12x12) - match dataset exactly
+    coords = torch.arange(0, 64, 5, dtype=torch.long)
     c = coords
-    y_sparse = x0_true_norm[c][:, c]  # (8, 8) - same as dataset
+    y_sparse = x0_true_norm[c][:, c]  # (12, 12) - same as dataset
     
     # Verify sparse observation shape and values
-    assert y_sparse.shape == (8, 8), f"Expected y_sparse shape (8, 8), got {y_sparse.shape}"
+    assert y_sparse.shape == (12, 12), f"Expected y_sparse shape (12, 12), got {y_sparse.shape}"
     
     # Prepare for model input
-    y_input = y_sparse.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 8, 8)
-    assert y_input.shape == (1, 1, 8, 8), f"Expected y_input shape (1, 1, 8, 8), got {y_input.shape}"
+    y_input = y_sparse.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 12, 12)
+    assert y_input.shape == (1, 1, 12, 12), f"Expected y_input shape (1, 1, 12, 12), got {y_input.shape}"
     
     # Generate multiple samples and average them
     print(f"Generating {num_samples} samples...", end=" ", flush=True)

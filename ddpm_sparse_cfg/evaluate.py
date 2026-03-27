@@ -22,15 +22,15 @@ def evaluate_on_test(trainer, test_loader, mean, std, num_batches=10, guidance_s
     """
     Runs CFG sampling and reports:
       - full-field MSE/MAE in original scale
-      - sensor MSE in original scale (8x8 grid)
+      - sensor MSE in original scale (12x12 grid)
     """
     device = trainer.device
     trainer.model.eval()
 
-    coords = torch.arange(0, 64, 8, device=device)
+    coords = torch.arange(0, 64, 5, device=device)
 
     def H(x64):  # x64: (B,64,64)
-        return x64[:, coords][:, :, coords]  # (B,8,8)
+        return x64[:, coords][:, :, coords]  # (B,12,12)
 
     mse_list, mae_list, sensor_mse_list = [], [], []
     
@@ -55,7 +55,7 @@ def evaluate_on_test(trainer, test_loader, mean, std, num_batches=10, guidance_s
 
         batch_start = time.time()
         x0_norm = x0_norm.to(device)  # (B,1,64,64), normalized
-        y_norm  = y_norm.to(device)   # (B,1,8,8), normalized
+        y_norm  = y_norm.to(device)   # (B,1,12,12), normalized
 
         B = x0_norm.size(0)
         total_samples += B
@@ -231,8 +231,8 @@ def run_eval(ckpt_path: str, data_path: str, batch_size: int = 32, num_batches: 
     print(f"Preparing Evaluation DataLoaders")
     print(f"{'='*60}")
     
-    train_ds = NavierStokesSparseDataset(train_sampled, mean=mean, std=std, sensor_stride=8)
-    test_ds = NavierStokesSparseDataset(test_sampled, mean=mean, std=std, sensor_stride=8)
+    train_ds = NavierStokesSparseDataset(train_sampled, mean=mean, std=std, sensor_stride=5)
+    test_ds = NavierStokesSparseDataset(test_sampled, mean=mean, std=std, sensor_stride=5)
     
     train_loader = DataLoader(
         train_ds,
