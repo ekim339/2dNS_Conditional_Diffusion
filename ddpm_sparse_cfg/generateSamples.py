@@ -36,10 +36,11 @@ def generate_and_plot_sample(
     # Normalize
     x0_true_norm = (x0_true - mean) / (std + 1e-8)
     
-    # Build sparse observation y (12x12) - match dataset exactly
-    coords = torch.arange(0, 64, 5, dtype=torch.long)
+    # Build sparse observation y (12x12). Note: arange(0, 64, 5) yields 13 points (includes 60).
+    # Use arange(0, 60, 5) for exactly 12 samples at stride 5: 0,5,...,55.
+    coords = torch.arange(0, 60, 5, dtype=torch.long)
     c = coords
-    y_sparse = x0_true_norm[c][:, c]  # (12, 12) - same as dataset
+    y_sparse = x0_true_norm[c][:, c]  # (12, 12) - same as intended 12x12 dataset grid
     
     # Verify sparse observation shape and values
     assert y_sparse.shape == (12, 12), f"Expected y_sparse shape (12, 12), got {y_sparse.shape}"
@@ -244,7 +245,7 @@ def compare_train_and_test_samples(
 
 if __name__ == "__main__":
     # Configuration
-    ckpt_path = "/Users/eugenekim/2dNS_Conditional_Diffusion/checkpoint/w=1p=0.pt"
+    ckpt_path = "/Users/eugenekim/2dNS_Conditional_Diffusion/checkpoint/best.pt"
     data_path = "/Users/eugenekim/2dNS_Conditional_Diffusion/NSE_Data(Noisy).npy"
     guidance_scale = None  # None = use checkpoint's guidance_scale, or set explicitly (e.g., 4.0)
     

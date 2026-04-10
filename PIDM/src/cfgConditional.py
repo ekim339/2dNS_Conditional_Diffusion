@@ -345,7 +345,7 @@ class DiffusionConfig:
     epochs: int = 10
     guidance_scale: float = 10.0  # CFG sampling scale
     use_amp: bool = True
-    lambda_phys: float = 0.1
+    lambda_phys: float = 1e-6
     dt_phys: float = 1e-3
     viscosity: float = 1e-3
 
@@ -425,7 +425,8 @@ class DDPMTrainer:
         k2[0, 0] = 1.0  # avoid division by zero
 
         # --- Solve Poisson: ∇²ψ = -ω ---
-        psi_fft = -w_fft / k2
+        eps = 1e-6
+        psi_fft = -w_fft / (k2 + eps)
         psi_fft[..., 0, 0] = 0.0
 
         # --- Velocity field ---
@@ -437,7 +438,9 @@ class DDPMTrainer:
         w_y = torch.fft.irfft2(1j * ky * w_fft, s=(H, W))
 
         # --- Laplacian ---
-        lap_w = torch.fft.irfft2(-(kx**2 + ky**2) * w_fft, s=(H, W))
+        lap_fft = -(kx**2 + ky**2) * w_fft
+        lap_fft = torch.clamp(lap_fft.real, -1e5, 1e5) + 1j * torch.clamp(lap_fft.imag, -1e5, 1e5)
+        lap_w = torch.fft.irfft2(lap_fft, s=(H, W))
 
         # --- Time derivative ---
         w_t = (w_next - w_prev) / (2.0 * dt)
@@ -594,7 +597,7 @@ class DDPMTrainer:
                 else:
                     loss_phys = torch.tensor(0.0, device=x_t.device)
 
-            loss = loss_diff + self.cfg.lambda_phys * loss_physloss = loss_diff + self.cfg.lambda_phys * loss_phys
+                loss = loss_diff + self.cfg.lambda_phys * loss_phys
 
             self.scaler.scale(loss).backward()
             if self.cfg.grad_clip is not None:
@@ -626,7 +629,7 @@ class DDPMTrainer:
             f"  Epoch {epoch} complete | Average Loss: {avg_loss:.6f} | "
             f"Average Diff: {avg_diff_loss:.6f} | Average Phys: {avg_phys_loss:.6f}"
         )
-        return avg_loss
+        return avg_loss, avg_diff_loss, avg_phys_loss
 
     @torch.no_grad()
     def eval_recon_mse(self, loader: DataLoader, num_batches: int = 2) -> float:
@@ -756,7 +759,7 @@ def run_training(
 
         for epoch in range(1, cfg.epochs + 1):
             t0 = time.time()
-            train_loss = trainer.train_one_epoch(train_loader, epoch)
+            train_loss, train_loss_data, train_loss_physics = trainer.train_one_epoch(train_loader, epoch)
             
             ckpt = {
                 "model": trainer.model.state_dict(),
@@ -771,9 +774,15 @@ def run_training(
             dt = time.time() - t0
 
             mlflow.log_metric("train_loss", float(train_loss), step=epoch)
+            mlflow.log_metric("train_loss_data", float(train_loss_data), step=epoch)
+            mlflow.log_metric("train_loss_physics", float(train_loss_physics), step=epoch)
             mlflow.log_metric("test_recon_mse", float(test_mse), step=epoch)
 
-            print(f"Epoch {epoch:03d} | train_loss={train_loss:.6f} | test_recon_mse~={test_mse:.6f} | {dt:.1f}s")
+            print(
+                f"Epoch {epoch:03d} | train_loss={train_loss:.6f} "
+                f"(data={train_loss_data:.6f}, phys={train_loss_physics:.6f}) | "
+                f"test_recon_mse~={test_mse:.6f} | {dt:.1f}s"
+            )
 
             if math.isnan(test_mse):
                 print("WARNING: test_mse is NaN; saving anyway.")

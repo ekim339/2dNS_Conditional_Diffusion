@@ -27,7 +27,8 @@ def evaluate_on_test(trainer, test_loader, mean, std, num_batches=10, guidance_s
     device = trainer.device
     trainer.model.eval()
 
-    coords = torch.arange(0, 64, 5, device=device)
+    # Stride-5 “12” grid: arange(0, 64, 5) has 13 indices; use 0..55 for 12x12.
+    coords = torch.arange(0, 60, 5, device=device)
 
     def H(x64):  # x64: (B,64,64)
         return x64[:, coords][:, :, coords]  # (B,12,12)

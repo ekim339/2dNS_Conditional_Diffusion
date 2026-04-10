@@ -33,10 +33,10 @@ def generate_and_plot_sample(
     # Normalize
     x0_true_norm = (x0_true - mean) / (std + 1e-8)
     
-    # Build sparse observation y (12x12) - match dataset exactly
-    coords = torch.arange(0, 64, 5, dtype=torch.long)
+    # 12x12 grid at stride 5: arange(0, 64, 5) is 13 points; use 0..55 only.
+    coords = torch.arange(0, 60, 5, dtype=torch.long)
     c = coords
-    y_sparse = x0_true_norm[c][:, c]  # (12, 12) - same as dataset
+    y_sparse = x0_true_norm[c][:, c]  # (12, 12)
     
     # Verify sparse observation shape and values
     assert y_sparse.shape == (12, 12), f"Expected y_sparse shape (12, 12), got {y_sparse.shape}"
