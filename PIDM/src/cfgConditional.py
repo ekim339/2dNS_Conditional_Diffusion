@@ -467,7 +467,6 @@ class DDPMTrainer:
         sqrt_om = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
 
         x0_pred = (x_t - sqrt_om * eps) / (sqrt_acp + 1e-8)
-        x0_pred = torch.clamp(x0_pred, -3.0, 3.0)
 
         # DDPM posterior mean formula:
         betas_t = extract(self.betas, t, x_t.shape)
@@ -587,6 +586,7 @@ class DDPMTrainer:
                     sqrt_om = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)[idx_c]
 
                     x0_pred = (x_t[idx_c] - sqrt_om * eps_pred_phys) / (sqrt_acp + 1e-8)
+                    x0_pred = torch.clamp(x0_pred, -3.0, 3.0)
 
                     # de-normalize
                     scale = self.data_std + 1e-8
