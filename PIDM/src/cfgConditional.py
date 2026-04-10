@@ -345,7 +345,7 @@ class DiffusionConfig:
     epochs: int = 10
     guidance_scale: float = 10.0  # CFG sampling scale
     use_amp: bool = True
-    lambda_phys: float = 1e-6
+    lambda_phys: float = 1e-8
     dt_phys: float = 1e-3
     viscosity: float = 1e-3
 
