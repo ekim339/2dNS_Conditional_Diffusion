@@ -699,13 +699,13 @@ def run_training(
     cfg = DiffusionConfig(
         T=1000,
         beta_schedule="cosine",
-        drop_prob=0.1,
+        drop_prob=0,
         lr=2e-4,
         batch_size=64,
         num_workers=0,  # Set to 0 for macOS compatibility (multiprocessing issues)
         grad_clip=1.0,
-        epochs=10,
-        guidance_scale=4.0,
+        epochs=30,
+        guidance_scale=1.0,
         use_amp=True,
     )
 
