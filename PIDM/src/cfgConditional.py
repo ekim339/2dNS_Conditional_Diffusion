@@ -586,7 +586,7 @@ class DDPMTrainer:
                     sqrt_om = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)[idx_c]
 
                     x0_pred = (x_t[idx_c] - sqrt_om * eps_pred_phys) / (sqrt_acp + 1e-8)
-                    x0_pred = torch.clamp(x0_pred, -3.0, 3.0)
+                    x0_pred = torch.clamp(x0_pred, -5.0, 5.0)
 
                     # de-normalize
                     scale = self.data_std + 1e-8
@@ -598,7 +598,6 @@ class DDPMTrainer:
                     residual = self.pde_residual(omega_prev_phys[idx_c], x0_phys, omega_next_phys[idx_c])
                     # residual = torch.clamp(residual, -200.0, 200.0)
                     loss_phys = F.smooth_l1_loss(residual, torch.zeros_like(residual))
-                    loss_phys = torch.clamp(loss_phys, max=1e3)
                 else:
                     loss_phys = torch.tensor(0.0, device=x_t.device)
 
