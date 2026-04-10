@@ -24,7 +24,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 import numpy as np
 import torch
@@ -32,6 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import mlflow
+from mlflow.tracking import MlflowClient
 
 
 # -------------------------
@@ -637,6 +638,9 @@ def run_training(
                 "cfg": cfg.__dict__,
                 "train_mean": train_mean,
                 "train_std": train_std,
+                "last_epoch": epoch,
+                "optimizer": trainer.opt.state_dict(),
+                "scaler": trainer.scaler.state_dict(),
             }
             torch.save(ckpt, os.path.join(out_dir, "conditional.pt"))
             print("Saved conditional.pt (pre-eval).")
@@ -662,6 +666,9 @@ def run_training(
                     "cfg": cfg.__dict__,
                     "train_mean": train_mean,
                     "train_std": train_std,
+                    "last_epoch": epoch,
+                    "optimizer": trainer.opt.state_dict(),
+                    "scaler": trainer.scaler.state_dict(),
                 }
                 ckpt_path = os.path.join(out_dir, "best.pt")
                 
@@ -691,6 +698,9 @@ def run_training(
             "cfg": cfg.__dict__,
             "train_mean": train_mean,
             "train_std": train_std,
+            "last_epoch": cfg.epochs,
+            "optimizer": trainer.opt.state_dict(),
+            "scaler": trainer.scaler.state_dict(),
         },
         last_ckpt_path,
     )
@@ -709,6 +719,192 @@ def run_training(
         print(f"WARNING: Last checkpoint not found at {last_ckpt_path}")
     
     return final_ckpt_path, (train_mean, train_std), cfg
+
+
+def _diffusion_config_from_ckpt(cfg_dict: Dict[str, Any]) -> DiffusionConfig:
+    fields = set(DiffusionConfig.__dataclass_fields__.keys())
+    return DiffusionConfig(**{k: v for k, v in cfg_dict.items() if k in fields})
+
+
+def mlflow_last_logged_step(tracking_uri: str, run_id: str, metric_name: str = "train_loss") -> int:
+    """Largest `step` seen for `metric_name` in the given run (0 if none)."""
+    client = MlflowClient(tracking_uri)
+    history = client.get_metric_history(run_id, metric_name)
+    if not history:
+        return 0
+    return max(h.step for h in history)
+
+
+def run_training_resume(
+    data,
+    ckpt_path: str,
+    out_dir: str,
+    additional_epochs: int,
+    mlflow_run_id: Optional[str] = None,
+    seed: int = 0,
+    epoch_offset: Optional[int] = None,
+):
+    """
+    Resume training from a checkpoint produced by `run_training` (ddpm_sparse_cfg).
+
+    - Reloads model weights and (if present) optimizer + GradScaler state.
+    - Uses `train_mean` / `train_std` from the checkpoint (same normalization as original run).
+    - If `mlflow_run_id` is set, continues that MLflow run and logs metrics with `step` after the
+      last logged `train_loss` step (or `epoch_offset` if you pass it explicitly).
+    - If `mlflow_run_id` is None, starts a new MLflow run named `cfg_conditional_ddpm_resume`.
+
+    Returns:
+        (best_ckpt_path, (train_mean, train_std), cfg)
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    seed_everything(seed)
+    device = default_device()
+    print("Device:", device)
+    print(f"Resuming from checkpoint: {os.path.abspath(ckpt_path)}")
+
+    try:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(ckpt_path, map_location=device)
+    train_mean = float(ckpt["train_mean"])
+    train_std = float(ckpt["train_std"])
+    cfg = _diffusion_config_from_ckpt(ckpt["cfg"])
+
+    if isinstance(data, np.ndarray):
+        data_t = torch.from_numpy(data)
+    elif torch.is_tensor(data):
+        data_t = data
+    else:
+        raise TypeError("data must be a numpy array or torch tensor")
+
+    assert data_t.ndim == 3 and data_t.shape[1:] == (64, 64), f"Expected (N,64,64), got {data_t.shape}"
+    N = data_t.shape[0]
+    n_train = int(0.8 * N)
+    train_full = data_t[:n_train]
+    test_full = data_t[n_train:]
+
+    train_ds = NavierStokesSparseDataset(train_full, mean=train_mean, std=train_std, sensor_stride=8)
+    test_ds = NavierStokesSparseDataset(test_full, mean=train_mean, std=train_std, sensor_stride=8)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=True,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
+
+    model = ConditionalDDPM(T=cfg.T, emb_dim=256, base_ch=64)
+    model.load_state_dict(ckpt["model"])
+    trainer = DDPMTrainer(model, cfg, device)
+
+    if "optimizer" in ckpt and ckpt["optimizer"] is not None:
+        trainer.opt.load_state_dict(ckpt["optimizer"])
+        print("Loaded optimizer state from checkpoint.")
+    else:
+        print("No optimizer state in checkpoint; optimizer reinitialized.")
+
+    if "scaler" in ckpt and ckpt["scaler"] is not None:
+        try:
+            trainer.scaler.load_state_dict(ckpt["scaler"])
+            print("Loaded GradScaler state from checkpoint.")
+        except Exception as e:
+            print(f"Could not load GradScaler state: {e}")
+
+    # Must match run_training: file:{out_dir}/mlruns (use same absolute path for metric lookup)
+    mlflow_uri = f"file:{os.path.abspath(os.path.join(out_dir, 'mlruns'))}"
+    mlflow.set_tracking_uri(mlflow_uri)
+    mlflow.set_experiment("conditional_ddpm_2dns")
+
+    if mlflow_run_id:
+        if epoch_offset is not None:
+            start_step = int(epoch_offset)
+        else:
+            start_step = mlflow_last_logged_step(mlflow_uri, mlflow_run_id, "train_loss")
+            if start_step == 0:
+                start_step = int(ckpt.get("last_epoch", 0))
+        print(f"MLflow run {mlflow_run_id}: logging new epochs at step > {start_step} (next step = {start_step + 1})")
+    else:
+        start_step = int(ckpt.get("last_epoch", 0))
+        print(f"Starting new MLflow run; metric steps start after {start_step} (next step = {start_step + 1}).")
+
+    best_test = float("inf")
+    ckpt_best_path = os.path.join(out_dir, "best.pt")
+
+    run_ctx = (
+        mlflow.start_run(run_id=mlflow_run_id)
+        if mlflow_run_id
+        else mlflow.start_run(run_name="cfg_conditional_ddpm_resume")
+    )
+
+    with run_ctx:
+        if not mlflow_run_id:
+            mlflow.log_param("resumed_from_ckpt", os.path.abspath(ckpt_path))
+            mlflow.log_param("seed", seed)
+            mlflow.log_param("train_mean", train_mean)
+            mlflow.log_param("train_std", train_std)
+            mlflow.log_param("additional_epochs", additional_epochs)
+
+        for i in range(1, additional_epochs + 1):
+            log_step = start_step + i
+            t0 = time.time()
+            train_loss = trainer.train_one_epoch(train_loader, i)
+
+            payload = {
+                "model": trainer.model.state_dict(),
+                "cfg": cfg.__dict__,
+                "train_mean": train_mean,
+                "train_std": train_std,
+                "last_epoch": log_step,
+                "optimizer": trainer.opt.state_dict(),
+                "scaler": trainer.scaler.state_dict() if hasattr(trainer.scaler, "state_dict") else None,
+            }
+            torch.save(payload, os.path.join(out_dir, "conditional.pt"))
+
+            test_mse = trainer.eval_recon_mse(test_loader, num_batches=2)
+            dt = time.time() - t0
+
+            mlflow.log_metric("train_loss", float(train_loss), step=log_step)
+            mlflow.log_metric("test_recon_mse", float(test_mse), step=log_step)
+
+            print(
+                f"Epoch (resume {i}/{additional_epochs}) global_step={log_step} | "
+                f"train_loss={train_loss:.6f} | test_recon_mse~={test_mse:.6f} | {dt:.1f}s"
+            )
+
+            if math.isnan(test_mse):
+                test_mse = float("inf")
+
+            if test_mse < best_test:
+                best_test = test_mse
+                torch.save(payload, ckpt_best_path)
+                mlflow.log_artifact(os.path.join(out_dir, "conditional.pt"), artifact_path="checkpoints")
+                mlflow.log_artifact(ckpt_best_path, artifact_path="checkpoints")
+                print(f"  ✓ NEW BEST: {os.path.abspath(ckpt_best_path)}")
+
+    torch.save(
+        {
+            "model": trainer.model.state_dict(),
+            "cfg": cfg.__dict__,
+            "train_mean": train_mean,
+            "train_std": train_std,
+            "last_epoch": start_step + additional_epochs,
+            "optimizer": trainer.opt.state_dict(),
+            "scaler": trainer.scaler.state_dict() if hasattr(trainer.scaler, "state_dict") else None,
+        },
+        os.path.join(out_dir, "conditional.pt"),
+    )
+
+    return ckpt_best_path, (train_mean, train_std), cfg
 
 
 # -------------------------

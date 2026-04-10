@@ -587,17 +587,19 @@ class DDPMTrainer:
                     omega_prev_phys = omega_prev * scale + self.data_mean
                     omega_next_phys = omega_next * scale + self.data_mean
 
-                    loss_phys = torch.mean(
-                        self.pde_residual(
-                            omega_prev_phys[idx_c],
-                            x0_phys,
-                            omega_next_phys[idx_c]
-                        ) ** 2
-                    )
+                    residual = self.pde_residual(...)
+                    residual = torch.clamp(residual, -50.0, 50.0)
+                    loss_phys = torch.mean(residual ** 2)
                 else:
                     loss_phys = torch.tensor(0.0, device=x_t.device)
 
                 loss = loss_diff + self.cfg.lambda_phys * loss_phys
+
+                # skip bad batches
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"Skipping bad batch at batch {batch_idx + 1}")
+                    print(f"  Diff: {loss_diff.item()} | Phys: {loss_phys.item()}")
+                    continue
 
             self.scaler.scale(loss).backward()
             if self.cfg.grad_clip is not None:
