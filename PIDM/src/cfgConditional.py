@@ -124,11 +124,20 @@ class NavierStokesSparseDataset(Dataset):
         x0 = (x0 - self.mean) / (self.std + 1e-8)
         x_next = (x_next - self.mean) / (self.std + 1e-8)
 
-        # get sparse observation y (8, 8) by uniform subsampling
+        # get sparse observations y_prev, y, y_next (8, 8) by uniform subsampling
         c = self.registered_coords
+        y_prev = x_prev[c][:, c]  # (8, 8)
         y = x0[c][:, c]  # (8, 8)
+        y_next = x_next[c][:, c]  # (8, 8)
 
-        return x_prev.unsqueeze(0), x0.unsqueeze(0), x_next.unsqueeze(0), y.unsqueeze(0)
+        return (
+            x_prev.unsqueeze(0),
+            x0.unsqueeze(0),
+            x_next.unsqueeze(0),
+            y_prev.unsqueeze(0),
+            y.unsqueeze(0),
+            y_next.unsqueeze(0),
+        )
 
 
 # -------------------------
@@ -345,7 +354,7 @@ class DiffusionConfig:
     epochs: int = 30
     guidance_scale: float = 1.0  # CFG sampling scale
     use_amp: bool = True
-    lambda_phys: float = 1e-8
+    lambda_phys: float = 5e-5
     dt_phys: float = 1e-3
     viscosity: float = 1e-3
 
@@ -445,7 +454,7 @@ class DDPMTrainer:
 
         # --- Laplacian ---
         lap_fft = -(kx**2 + ky**2) * w_fft
-        lap_fft = torch.clamp(lap_fft.real, -1e6, 1e6) + 1j * torch.clamp(lap_fft.imag, -1e6, 1e6)
+        #lap_fft = torch.clamp(lap_fft.real, -1e6, 1e6) + 1j * torch.clamp(lap_fft.imag, -1e6, 1e6)
         lap_w = torch.fft.irfft2(lap_fft, s=(H, W))
 
         # --- Time derivative ---
@@ -537,11 +546,13 @@ class DDPMTrainer:
         
         print(f"  Starting epoch {epoch} ({num_batches} batches)...")
 
-        for batch_idx, (omega_prev, x0, omega_next, y) in enumerate(loader):
+        for batch_idx, (omega_prev, x0, omega_next, y_prev, y, y_next) in enumerate(loader):
             omega_prev = omega_prev.to(self.device)  # (B,1,64,64)
             x0 = x0.to(self.device)  # (B,1,64,64)
             omega_next = omega_next.to(self.device)  # (B,1,64,64)
+            y_prev = y_prev.to(self.device)  # (B,1,8,8)
             y = y.to(self.device)    # (B,1,8,8)
+            y_next = y_next.to(self.device)  # (B,1,8,8)
 
             B = x0.size(0)
             t = torch.randint(0, self.cfg.T, (B,), device=self.device, dtype=torch.long)
@@ -577,25 +588,40 @@ class DDPMTrainer:
 
                 loss_diff = loss / max(denom, 1)
 
-                # Physics loss with conditional reconstruction at timestep k.
+                # Physics loss with sampled/predicted reconstructions at k-1, k, k+1.
                 if idx_c.numel() > 0:
-                    # correct conditional prediction
-                    eps_pred_phys = self.model(x_t[idx_c], t[idx_c], y[idx_c])
+                    t_c = t[idx_c]
 
                     sqrt_acp = extract(self.sqrt_alphas_cumprod, t, x_t.shape)[idx_c]
                     sqrt_om = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)[idx_c]
 
-                    x0_pred = (x_t[idx_c] - sqrt_om * eps_pred_phys) / (sqrt_acp + 1e-8)
-                    x0_pred = torch.clamp(x0_pred, -10.0, 10.0)
+                    # center prediction w_hat^k
+                    eps_pred_center = self.model(x_t[idx_c], t_c, y[idx_c])
+                    x0_pred = (x_t[idx_c] - sqrt_om * eps_pred_center) / (sqrt_acp + 1e-8)
+                    #x0_pred = torch.clamp(x0_pred, -10.0, 10.0)
+
+                    # neighbor predictions w_hat^{k-1}, w_hat^{k+1}
+                    noise_prev = torch.randn_like(omega_prev[idx_c])
+                    noise_next = torch.randn_like(omega_next[idx_c])
+                    x_t_prev = self.q_sample(omega_prev[idx_c], t_c, noise_prev)
+                    x_t_next = self.q_sample(omega_next[idx_c], t_c, noise_next)
+
+                    eps_pred_prev = self.model(x_t_prev, t_c, y_prev[idx_c])
+                    eps_pred_next = self.model(x_t_next, t_c, y_next[idx_c])
+
+                    x_prev_pred = (x_t_prev - sqrt_om * eps_pred_prev) / (sqrt_acp + 1e-8)
+                    x_next_pred = (x_t_next - sqrt_om * eps_pred_next) / (sqrt_acp + 1e-8)
+                    #x_prev_pred = torch.clamp(x_prev_pred, -10.0, 10.0)
+                    #x_next_pred = torch.clamp(x_next_pred, -10.0, 10.0)
 
                     # de-normalize
                     scale = self.data_std + 1e-8
                     x0_phys = x0_pred * scale + self.data_mean
-                    x0_phys = torch.clamp(x0_phys, -10.0, 10.0)
-                    omega_prev_phys = omega_prev * scale + self.data_mean
-                    omega_next_phys = omega_next * scale + self.data_mean
+                    #x0_phys = torch.clamp(x0_phys, -10.0, 10.0)
+                    omega_prev_phys = x_prev_pred * scale + self.data_mean
+                    omega_next_phys = x_next_pred * scale + self.data_mean
 
-                    residual = self.pde_residual(omega_prev_phys[idx_c], x0_phys, omega_next_phys[idx_c])
+                    residual = self.pde_residual(omega_prev_phys, x0_phys, omega_next_phys)
                     # residual = torch.clamp(residual, -200.0, 200.0)
                     loss_phys = F.smooth_l1_loss(residual, torch.zeros_like(residual))
                 else:
@@ -649,7 +675,7 @@ class DDPMTrainer:
         """
         self.model.eval()
         mses = []
-        for i, (_, x0, _, y) in enumerate(loader):
+        for i, (_, x0, _, _, y, _) in enumerate(loader):
             if i >= num_batches:
                 break
             x0 = x0.to(self.device)
