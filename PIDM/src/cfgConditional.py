@@ -433,19 +433,19 @@ class DDPMTrainer:
         u = torch.fft.irfft2(1j * ky * psi_fft, s=(H, W))
         v = torch.fft.irfft2(-1j * kx * psi_fft, s=(H, W))
 
-        u = torch.clamp(u, -3.0, 3.0)
-        v = torch.clamp(v, -3.0, 3.0)
+        u = torch.clamp(u, -10.0, 10.0)
+        v = torch.clamp(v, -10.0, 10.0)
 
         # --- Spatial derivatives of ω ---
         w_x = torch.fft.irfft2(1j * kx * w_fft, s=(H, W))
         w_y = torch.fft.irfft2(1j * ky * w_fft, s=(H, W))
 
-        w_x = torch.clamp(w_x, -50.0, 50.0)
-        w_y = torch.clamp(w_y, -50.0, 50.0)
+        w_x = torch.clamp(w_x, -100.0, 100.0)
+        w_y = torch.clamp(w_y, -100.0, 100.0)
 
         # --- Laplacian ---
         lap_fft = -(kx**2 + ky**2) * w_fft
-        lap_fft = torch.clamp(lap_fft.real, -1e5, 1e5) + 1j * torch.clamp(lap_fft.imag, -1e5, 1e5)
+        lap_fft = torch.clamp(lap_fft.real, -1e6, 1e6) + 1j * torch.clamp(lap_fft.imag, -1e6, 1e6)
         lap_w = torch.fft.irfft2(lap_fft, s=(H, W))
 
         # --- Time derivative ---
@@ -586,12 +586,12 @@ class DDPMTrainer:
                     sqrt_om = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)[idx_c]
 
                     x0_pred = (x_t[idx_c] - sqrt_om * eps_pred_phys) / (sqrt_acp + 1e-8)
-                    x0_pred = torch.clamp(x0_pred, -5.0, 5.0)
+                    x0_pred = torch.clamp(x0_pred, -10.0, 10.0)
 
                     # de-normalize
                     scale = self.data_std + 1e-8
                     x0_phys = x0_pred * scale + self.data_mean
-                    x0_phys = torch.clamp(x0_phys, -5.0, 5.0)
+                    x0_phys = torch.clamp(x0_phys, -10.0, 10.0)
                     omega_prev_phys = omega_prev * scale + self.data_mean
                     omega_next_phys = omega_next * scale + self.data_mean
 
