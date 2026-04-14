@@ -337,13 +337,13 @@ class ConditionalDDPM(nn.Module):
 class DiffusionConfig:
     T: int = 1000
     beta_schedule: str = "cosine"
-    drop_prob: float = 0.1     # CFG condition dropout probability
+    drop_prob: float = 0     # CFG condition dropout probability
     lr: float = 2e-4
     batch_size: int = 64
     num_workers: int = 0  # Set to 0 for macOS compatibility (multiprocessing issues)
     grad_clip: float = 1.0
-    epochs: int = 10
-    guidance_scale: float = 10.0  # CFG sampling scale
+    epochs: int = 30
+    guidance_scale: float = 1.0  # CFG sampling scale
     use_amp: bool = True
     lambda_phys: float = 1e-8
     dt_phys: float = 1e-3
