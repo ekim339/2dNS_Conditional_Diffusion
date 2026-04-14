@@ -454,7 +454,7 @@ class DDPMTrainer:
 
         # --- Laplacian ---
         lap_fft = -(kx**2 + ky**2) * w_fft
-        #lap_fft = torch.clamp(lap_fft.real, -1e6, 1e6) + 1j * torch.clamp(lap_fft.imag, -1e6, 1e6)
+        lap_fft = torch.clamp(lap_fft.real, -1e6, 1e6) + 1j * torch.clamp(lap_fft.imag, -1e6, 1e6)
         lap_w = torch.fft.irfft2(lap_fft, s=(H, W))
 
         # --- Time derivative ---
@@ -598,7 +598,7 @@ class DDPMTrainer:
                     # center prediction w_hat^k
                     eps_pred_center = self.model(x_t[idx_c], t_c, y[idx_c])
                     x0_pred = (x_t[idx_c] - sqrt_om * eps_pred_center) / (sqrt_acp + 1e-8)
-                    #x0_pred = torch.clamp(x0_pred, -10.0, 10.0)
+                    x0_pred = torch.clamp(x0_pred, -300.0, 300.0)
 
                     # neighbor predictions w_hat^{k-1}, w_hat^{k+1}
                     noise_prev = torch.randn_like(omega_prev[idx_c])
@@ -611,8 +611,8 @@ class DDPMTrainer:
 
                     x_prev_pred = (x_t_prev - sqrt_om * eps_pred_prev) / (sqrt_acp + 1e-8)
                     x_next_pred = (x_t_next - sqrt_om * eps_pred_next) / (sqrt_acp + 1e-8)
-                    #x_prev_pred = torch.clamp(x_prev_pred, -10.0, 10.0)
-                    #x_next_pred = torch.clamp(x_next_pred, -10.0, 10.0)
+                    x_prev_pred = torch.clamp(x_prev_pred, -300.0, 300.0)
+                    x_next_pred = torch.clamp(x_next_pred, -300.0, 300.0)
 
                     # de-normalize
                     scale = self.data_std + 1e-8
