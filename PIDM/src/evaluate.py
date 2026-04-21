@@ -67,13 +67,15 @@ def evaluate_on_test(
     total_samples = 0
     start_time = time.time()
 
-    for b, (x0_norm, y_norm) in enumerate(test_loader):
+    # Dataset returns 6 tensors for physics training: center frame + y is what we evaluate.
+    for b, batch in enumerate(test_loader):
         if num_batches is not None and b >= num_batches:
             break
 
         batch_start = time.time()
-        x0_norm = x0_norm.to(device)  # (B,1,64,64), normalized
-        y_norm = y_norm.to(device)  # (B,1,8,8), normalized — matches PIDM CondEncoder8x8
+        _xp, x0_norm, _xn, _yp, y_norm, _yn = batch
+        x0_norm = x0_norm.to(device)  # (B,1,64,64), normalized — center time k
+        y_norm = y_norm.to(device)  # (B,1,8,8), sparse obs at k — matches CondEncoder8x8
 
         B = x0_norm.size(0)
         total_samples += B
@@ -342,29 +344,8 @@ def run_eval(
 
 
 if __name__ == "__main__":
-    _SRC = Path(__file__).resolve().parent
-    _PIDM_ROOT = _SRC.parent
-    _PROJ = _PIDM_ROOT.parent
-
-    default_ckpt = str(_PROJ / "checkpoint" / "best.pt")
-    if not os.path.isfile(default_ckpt):
-        _alt = _PIDM_ROOT / "trained_models" / "run_1" / "model" / "checkpoint_0.pt"
-        if _alt.is_file():
-            default_ckpt = str(_alt)
-
-    data_path = str(_PROJ / "NSE_Data(Noisy).npy")
-
-    if not os.path.exists(default_ckpt):
-        print("=" * 60)
-        print("ERROR: No PIDM checkpoint found!")
-        print("=" * 60)
-        print(f"Tried: {os.path.abspath(default_ckpt)}")
-        print("\nTrain PIDM or set a path to your .pt file, then run:")
-        print(f"  python -m evaluate  # from {_SRC}")
-        print("or:")
-        print("  python evaluate.py   # with cwd = PIDM/src")
-        print("=" * 60)
-        raise SystemExit(1)
+    default_ckpt = "/Users/eugenekim/2dNS_Conditional_Diffusion/checkpoint/PIDM.pt"
+    data_path = "/Users/eugenekim/2dNS_Conditional_Diffusion/NSE_Data(Noisy).npy"
 
     run_eval(
         ckpt_path=default_ckpt,
