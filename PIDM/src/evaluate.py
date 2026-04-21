@@ -344,8 +344,8 @@ def run_eval(
 
 
 if __name__ == "__main__":
-    default_ckpt = "/Users/eugenekim/2dNS_Conditional_Diffusion/checkpoint/PIDM.pt"
-    data_path = "/Users/eugenekim/2dNS_Conditional_Diffusion/NSE_Data(Noisy).npy"
+    default_ckpt = "/content/drive/MyDrive/Lab/CondDiff/PIDM/best.pt"
+    data_path = "/content/drive/MyDrive/Lab/CondDiff/NSE_Data(Noisy).npy"
 
     run_eval(
         ckpt_path=default_ckpt,
