@@ -357,6 +357,9 @@ class DiffusionConfig:
     lambda_phys: float = 5e-5
     dt_phys: float = 1e-3
     viscosity: float = 1e-3
+    # Low-pass cutoff in angular wavenumber |k| for physics loss.
+    # If None or <= 0, physics loss uses the full spectrum.
+    low_freq_k_cutoff: Optional[float] = 0.3
 
 
 class DDPMTrainer:
@@ -422,15 +425,24 @@ class DDPMTrainer:
         B, H, W = w_cur.shape
         device = w_cur.device
 
-        # --- FFT ---
-        w_fft = torch.fft.rfft2(w_cur)  # (B, H, W//2 + 1)
-
         # --- Correct frequency grids for rfft2 ---
         kx = (2 * math.pi) * torch.fft.fftfreq(H, device=device).view(H, 1)       # (H, 1)
         ky = (2 * math.pi) * torch.fft.rfftfreq(W, device=device).view(1, W // 2 + 1)  # (1, W//2+1)
 
-        # --- k^2 ---
+        # --- Optional low-pass filtering for physics residual ---
+        # Compute residual on omega_low = ifft(fft(omega) * mask_low).
         k2 = kx**2 + ky**2
+        k_cutoff = self.cfg.low_freq_k_cutoff
+        if k_cutoff is not None and k_cutoff > 0:
+            low_mask = (k2 < (float(k_cutoff) ** 2)).to(dtype=torch.float32)
+            w_prev = torch.fft.irfft2(torch.fft.rfft2(w_prev) * low_mask, s=(H, W))
+            w_cur = torch.fft.irfft2(torch.fft.rfft2(w_cur) * low_mask, s=(H, W))
+            w_next = torch.fft.irfft2(torch.fft.rfft2(w_next) * low_mask, s=(H, W))
+
+        # --- FFT ---
+        w_fft = torch.fft.rfft2(w_cur)  # (B, H, W//2 + 1)
+
+        # --- k^2 ---
         k2[0, 0] = 1.0  # avoid division by zero
 
         # --- Solve Poisson: ∇²ψ = -ω ---

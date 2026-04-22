@@ -59,6 +59,8 @@ logs/
 runs/
 wandb/
 tensorboard/
+ddpm_sparse_cfg/samples
+PIDM/samples
 
 # Model outputs
 outputs/
