@@ -1,14 +1,13 @@
 """
-Resume ddpm_sparse_cfg conditional DDPM training from a checkpoint.
+Resume PIDM conditional DDPM training from a checkpoint.
 
-Adds `ddpm_sparse_cfg` to sys.path and calls `run_training_resume` from cfgConditional.py.
+Loads a previous checkpoint, restores model/optimizer/scaler/epoch, and continues
+training via `run_training_resume` from PIDM `cfgConditional.py`.
 
 MLflow continuation:
-  Pass --mlflow-run-id with the run ID from the UI (or mlflow CLI) so new metrics append to the
-  same run with step = previous max(train_loss step) + 1, ...
-
-  Find run ID: open MLflow UI → run → copy Run ID, or:
-    mlflow experiments search --experiment-name conditional_ddpm_2dns
+  - If --mlflow-run-id is provided, logging continues on that run.
+  - Otherwise, if checkpoint contains mlflow_run_id, it is reused automatically.
+  - Else, a new MLflow run is created.
 """
 import argparse
 import os
@@ -17,16 +16,16 @@ from pathlib import Path
 
 # Project root: .../2dNS_Conditional_Diffusion
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-_DDPM_SPARSE = _PROJECT_ROOT / "ddpm_sparse_cfg"
-if not _DDPM_SPARSE.is_dir():
-    raise FileNotFoundError(f"Expected ddpm_sparse_cfg at {_DDPM_SPARSE}")
-sys.path.insert(0, str(_DDPM_SPARSE))
+_PIDM_SRC = _PROJECT_ROOT / "PIDM" / "src"
+if not _PIDM_SRC.is_dir():
+    raise FileNotFoundError(f"Expected PIDM/src at {_PIDM_SRC}")
+sys.path.insert(0, str(_PIDM_SRC))
 
 from cfgConditional import run_training_resume  # noqa: E402
 
 
 def main():
-    p = argparse.ArgumentParser(description="Resume training from checkpoint (ddpm_sparse_cfg).")
+    p = argparse.ArgumentParser(description="Resume training from checkpoint (PIDM).")
     p.add_argument(
         "--data",
         type=str,
@@ -37,7 +36,7 @@ def main():
         "--ckpt",
         type=str,
         required=True,
-        help="Checkpoint .pt (best.pt or conditional.pt) from a previous run_training.",
+        help="Checkpoint .pt (best.pt or conditional.pt) from a previous PIDM training run.",
     )
     p.add_argument(
         "--out-dir",
@@ -55,7 +54,7 @@ def main():
         "--mlflow-run-id",
         type=str,
         default=None,
-        help="Existing MLflow run ID to continue logging (same metrics, higher step).",
+        help="Existing MLflow run ID to continue logging. If omitted, uses checkpoint run_id when available.",
     )
     p.add_argument(
         "--epoch-offset",

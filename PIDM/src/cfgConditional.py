@@ -23,6 +23,7 @@
 import math
 import os
 import time
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -32,6 +33,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import mlflow
+from mlflow.tracking import MlflowClient
 
 
 # -------------------------
@@ -699,6 +701,27 @@ class DDPMTrainer:
         return float(np.mean(mses)) if mses else float("nan")
 
 
+def _diffusion_config_from_ckpt(cfg_dict: dict) -> DiffusionConfig:
+    fields = set(DiffusionConfig.__dataclass_fields__.keys())
+    return DiffusionConfig(**{k: v for k, v in cfg_dict.items() if k in fields})
+
+
+def _next_mlflow_step(run_id: str, tracking_uri: str, metric_keys=("train_loss", "test_recon_mse")) -> int:
+    """
+    Return next step index for resumed MLflow logging.
+    """
+    client = MlflowClient(tracking_uri=tracking_uri)
+    max_step = -1
+    for key in metric_keys:
+        try:
+            hist = client.get_metric_history(run_id, key)
+            if hist:
+                max_step = max(max_step, max(m.step for m in hist))
+        except Exception:
+            continue
+    return max_step + 1
+
+
 # -------------------------
 # Main: build loaders, train, test sample
 # -------------------------
@@ -797,6 +820,7 @@ def run_training(
     mlflow.set_experiment("conditional_ddpm_2dns")
 
     with mlflow.start_run(run_name="cfg_conditional_ddpm"):
+        run_id = mlflow.active_run().info.run_id
         # log hyperparameters
         mlflow.log_params(cfg.__dict__)
         mlflow.log_param("seed", seed)
@@ -814,6 +838,11 @@ def run_training(
                 "cfg": cfg.__dict__,
                 "train_mean": train_mean,
                 "train_std": train_std,
+                "optimizer": trainer.opt.state_dict(),
+                "scaler": trainer.scaler.state_dict(),
+                "last_epoch": epoch,
+                "best_test_recon_mse": best_test,
+                "mlflow_run_id": run_id,
             }
             torch.save(ckpt, os.path.join(out_dir, "conditional.pt"))
             print("Saved conditional.pt (pre-eval).")
@@ -845,6 +874,11 @@ def run_training(
                     "cfg": cfg.__dict__,
                     "train_mean": train_mean,
                     "train_std": train_std,
+                    "optimizer": trainer.opt.state_dict(),
+                    "scaler": trainer.scaler.state_dict(),
+                    "last_epoch": epoch,
+                    "best_test_recon_mse": best_test,
+                    "mlflow_run_id": run_id,
                 }
                 ckpt_path = os.path.join(out_dir, "best.pt")
                 
@@ -874,6 +908,11 @@ def run_training(
             "cfg": cfg.__dict__,
             "train_mean": train_mean,
             "train_std": train_std,
+            "optimizer": trainer.opt.state_dict(),
+            "scaler": trainer.scaler.state_dict(),
+            "last_epoch": cfg.epochs,
+            "best_test_recon_mse": best_test,
+            "mlflow_run_id": run_id,
         },
         last_ckpt_path,
     )
@@ -891,6 +930,159 @@ def run_training(
     else:
         print(f"WARNING: Last checkpoint not found at {last_ckpt_path}")
     
+    return final_ckpt_path, (train_mean, train_std), cfg
+
+
+def run_training_resume(
+    data,
+    ckpt_path: str,
+    out_dir: str = None,
+    additional_epochs: int = 10,
+    mlflow_run_id: Optional[str] = None,
+    seed: int = 0,
+    epoch_offset: Optional[int] = None,
+):
+    """
+    Resume PIDM training from a checkpoint and optionally continue MLflow logging
+    on the same run.
+    """
+    seed_everything(seed)
+    device = default_device()
+
+    if out_dir is None:
+        out_dir = str(Path(ckpt_path).resolve().parent)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Data split (same convention as training)
+    if isinstance(data, np.ndarray):
+        data_t = torch.from_numpy(data)
+    elif torch.is_tensor(data):
+        data_t = data
+    else:
+        raise TypeError("data must be a numpy array or torch tensor")
+    assert data_t.ndim == 3 and data_t.shape[1:] == (64, 64), f"Expected (N,64,64), got {data_t.shape}"
+
+    N = data_t.shape[0]
+    n_train = int(0.8 * N)
+    train_full = data_t[:n_train]
+    test_full = data_t[n_train:]
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+    cfg = _diffusion_config_from_ckpt(ckpt["cfg"])
+    train_mean = float(ckpt["train_mean"])
+    train_std = float(ckpt["train_std"])
+    start_epoch = int(ckpt.get("last_epoch", 0))
+    end_epoch = start_epoch + int(additional_epochs)
+    best_test = float(ckpt.get("best_test_recon_mse", float("inf")))
+
+    train_ds = NavierStokesSparseDataset(train_full, mean=train_mean, std=train_std, sensor_stride=8)
+    test_ds = NavierStokesSparseDataset(test_full, mean=train_mean, std=train_std, sensor_stride=8)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=True,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
+
+    model = ConditionalDDPM(T=cfg.T, emb_dim=256, base_ch=64)
+    trainer = DDPMTrainer(model, cfg, device, data_mean=train_mean, data_std=train_std)
+    trainer.model.load_state_dict(ckpt["model"])
+
+    if "optimizer" in ckpt:
+        try:
+            trainer.opt.load_state_dict(ckpt["optimizer"])
+            print("Loaded optimizer state from checkpoint.")
+        except Exception as e:
+            print(f"WARNING: Failed to load optimizer state, using fresh optimizer: {e}")
+    if "scaler" in ckpt:
+        try:
+            trainer.scaler.load_state_dict(ckpt["scaler"])
+            print("Loaded AMP scaler state from checkpoint.")
+        except Exception as e:
+            print(f"WARNING: Failed to load scaler state, using fresh scaler: {e}")
+
+    print(f"Resuming from checkpoint: {os.path.abspath(ckpt_path)}")
+    print(f"Epoch range: {start_epoch + 1} .. {end_epoch} (additional={additional_epochs})")
+    print(f"Best test_recon_mse so far: {best_test}")
+
+    tracking_uri = f"file:{out_dir}/mlruns"
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_experiment("conditional_ddpm_2dns")
+
+    run_id = mlflow_run_id or ckpt.get("mlflow_run_id")
+    if run_id:
+        step_base = epoch_offset if epoch_offset is not None else _next_mlflow_step(run_id, tracking_uri)
+        print(f"Continuing MLflow run_id={run_id} at metric step {step_base}")
+        run_ctx = mlflow.start_run(run_id=run_id)
+    else:
+        step_base = 0 if epoch_offset is None else epoch_offset
+        print("No MLflow run_id provided/found; creating a new MLflow run.")
+        run_ctx = mlflow.start_run(run_name="cfg_conditional_ddpm_resume")
+
+    with run_ctx:
+        active_run_id = mlflow.active_run().info.run_id
+        mlflow.log_param("resume_from_ckpt", os.path.abspath(ckpt_path))
+        mlflow.log_param("resume_start_epoch", start_epoch)
+        mlflow.log_param("resume_additional_epochs", additional_epochs)
+
+        for epoch in range(start_epoch + 1, end_epoch + 1):
+            t0 = time.time()
+            train_loss, train_loss_data, train_loss_physics = trainer.train_one_epoch(train_loader, epoch)
+
+            test_mse = trainer.eval_recon_mse(test_loader, num_batches=2)
+            dt = time.time() - t0
+            ml_step = step_base + (epoch - start_epoch)
+
+            mlflow.log_metric("train_loss", float(train_loss), step=ml_step)
+            mlflow.log_metric("train_loss_data", float(train_loss_data), step=ml_step)
+            mlflow.log_metric("train_loss_physics", float(train_loss_physics), step=ml_step)
+            mlflow.log_metric("test_recon_mse", float(test_mse), step=ml_step)
+
+            if math.isnan(test_mse):
+                print("WARNING: test_mse is NaN; saving anyway.")
+                test_mse = float("inf")
+
+            ckpt_common = {
+                "model": trainer.model.state_dict(),
+                "cfg": cfg.__dict__,
+                "train_mean": train_mean,
+                "train_std": train_std,
+                "optimizer": trainer.opt.state_dict(),
+                "scaler": trainer.scaler.state_dict(),
+                "last_epoch": epoch,
+                "best_test_recon_mse": best_test,
+                "mlflow_run_id": active_run_id,
+            }
+            torch.save(ckpt_common, os.path.join(out_dir, "conditional.pt"))
+
+            print(
+                f"Epoch {epoch:03d} | train_loss={train_loss:.6f} "
+                f"(data={train_loss_data:.6f}, phys={train_loss_physics:.6f}) | "
+                f"test_recon_mse~={test_mse:.6f} | {dt:.1f}s"
+            )
+
+            if epoch == (start_epoch + 1) or test_mse < best_test:
+                best_test = test_mse
+                ckpt_common["best_test_recon_mse"] = best_test
+                best_path = os.path.join(out_dir, "best.pt")
+                torch.save(ckpt_common, best_path)
+                mlflow.log_artifact(os.path.join(out_dir, "conditional.pt"), artifact_path="checkpoints")
+                mlflow.log_artifact(best_path, artifact_path="checkpoints")
+                print(f"  ✓ NEW BEST! checkpoint={os.path.abspath(best_path)} | best={best_test:.6f}")
+
+    final_ckpt_path = os.path.join(out_dir, "best.pt")
+    last_ckpt_path = os.path.join(out_dir, "conditional.pt")
+    print("Done (resume). Best approx test recon MSE:", best_test)
     return final_ckpt_path, (train_mean, train_std), cfg
 
 
