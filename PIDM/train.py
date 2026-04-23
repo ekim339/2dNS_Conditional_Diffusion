@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from cfgConditional import run_training
+from model import run_training
 
 
 # NSE_data = np.load("/Users/eugenekim/2dNS_Conditional_Diffusion/NSE_Data(Noisy).npy")

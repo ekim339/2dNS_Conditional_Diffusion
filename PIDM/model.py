@@ -1032,8 +1032,8 @@ def run_training_resume(
     with run_ctx:
         active_run_id = mlflow.active_run().info.run_id
         mlflow.log_param("resume_from_ckpt", os.path.abspath(ckpt_path))
-        mlflow.log_param("resume_start_epoch", start_epoch)
-        mlflow.log_param("resume_additional_epochs", additional_epochs)
+        mlflow.log_metric("resume_start_epoch", start_epoch)
+        mlflow.log_metric("resume_additional_epochs", additional_epochs)
 
         for epoch in range(start_epoch + 1, end_epoch + 1):
             t0 = time.time()
