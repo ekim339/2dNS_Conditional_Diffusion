@@ -385,7 +385,7 @@ def run_interpolation(
     max_batches: Optional[int] = None,
     save_predictions: bool = False,
     use_mlflow: bool = True,
-    epochs: int = 30,
+    epochs: int = 1,
     resume: bool = False,
     resume_state_path: Optional[str] = None,
     mlflow_run_id: Optional[str] = None,
