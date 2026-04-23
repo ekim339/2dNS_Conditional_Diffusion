@@ -16,7 +16,6 @@ import os
 import time
 from typing import Dict, Iterable, Optional, Tuple
 
-import mlflow
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -307,75 +306,6 @@ def _save_resume_state(path: str, state: Dict[str, object]) -> None:
         json.dump(state, f, indent=2)
 
 
-def log_to_mlflow(
-    out_dir: str,
-    data_path: str,
-    method: str,
-    batch_size: int,
-    num_workers: int,
-    max_batches: Optional[int],
-    save_predictions: bool,
-    summary: Dict[str, object],
-    metrics_path: str,
-    train_npz: Optional[str],
-    test_npz: Optional[str],
-    step: int,
-    run_id: Optional[str] = None,
-    log_params: bool = True,
-) -> str:
-    tracking_uri = f"file:{out_dir}/mlruns"
-    mlflow.set_tracking_uri(tracking_uri)
-    mlflow.set_experiment("direct_spatial_interpolation_2dns")
-
-    if run_id:
-        run_ctx = mlflow.start_run(run_id=run_id)
-    else:
-        run_ctx = mlflow.start_run(run_name=f"interpolation_{method}")
-
-    with run_ctx as run:
-        run_id = run.info.run_id
-        if log_params:
-            try:
-                mlflow.log_params(
-                    {
-                        "method": method,
-                        "data_path": data_path,
-                        "sensor_stride": SENSOR_STRIDE,
-                        "batch_size": batch_size,
-                        "num_workers": num_workers,
-                        "max_batches": -1 if max_batches is None else int(max_batches),
-                        "save_predictions": bool(save_predictions),
-                        "train_mean": summary["normalization"]["train_mean"],
-                        "train_std": summary["normalization"]["train_std"],
-                        "num_train": summary["splits"]["train"]["total_samples"],
-                        "num_test": summary["splits"]["test"]["total_samples"],
-                    }
-                )
-            except Exception as e:
-                print(f"WARNING: mlflow.log_params skipped: {e}")
-
-        # Record interpolation errors. "train_loss" is train MSE for baseline parity.
-        mlflow.log_metric("train_loss", float(summary["splits"]["train"]["mse"]), step=step)
-        mlflow.log_metric("train_mae", float(summary["splits"]["train"]["mae"]), step=step)
-        mlflow.log_metric("train_sensor_mse", float(summary["splits"]["train"]["sensor_mse"]), step=step)
-
-        mlflow.log_metric("test_loss", float(summary["splits"]["test"]["mse"]), step=step)
-        mlflow.log_metric("test_mae", float(summary["splits"]["test"]["mae"]), step=step)
-        mlflow.log_metric("test_sensor_mse", float(summary["splits"]["test"]["sensor_mse"]), step=step)
-
-        mlflow.log_metric("combined_mse", float(summary["splits"]["combined"]["mse"]), step=step)
-        mlflow.log_metric("combined_mae", float(summary["splits"]["combined"]["mae"]), step=step)
-        mlflow.log_metric("combined_sensor_mse", float(summary["splits"]["combined"]["sensor_mse"]), step=step)
-
-        mlflow.log_artifact(metrics_path, artifact_path="results")
-        if train_npz:
-            mlflow.log_artifact(train_npz, artifact_path="results")
-        if test_npz:
-            mlflow.log_artifact(test_npz, artifact_path="results")
-
-    return run_id
-
-
 def run_interpolation(
     data_path: str,
     out_dir: str,
@@ -384,11 +314,9 @@ def run_interpolation(
     num_workers: int = 0,
     max_batches: Optional[int] = None,
     save_predictions: bool = False,
-    use_mlflow: bool = True,
     epochs: int = 1,
     resume: bool = False,
     resume_state_path: Optional[str] = None,
-    mlflow_run_id: Optional[str] = None,
 ) -> Dict[str, object]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_loader, test_loader, info = make_loaders(data_path, batch_size=batch_size, num_workers=num_workers)
@@ -396,15 +324,11 @@ def run_interpolation(
     resume_state_path = resume_state_path or _default_resume_state_path(out_dir)
 
     start_epoch = 0
-    state_run_id = None
     if resume:
         state = _load_resume_state(resume_state_path)
         start_epoch = int(state.get("last_epoch", 0))
-        state_run_id = state.get("mlflow_run_id")
         print(f"Resume enabled. State file: {resume_state_path}")
         print(f"Last completed epoch from state: {start_epoch}")
-
-    active_mlflow_run_id = mlflow_run_id or state_run_id
 
     print("=" * 60)
     print("Direct Spatial Interpolation Baseline")
@@ -508,26 +432,6 @@ def run_interpolation(
         if test_npz:
             print(f"Saved test predictions: {test_npz}")
 
-        if use_mlflow:
-            active_mlflow_run_id = log_to_mlflow(
-                out_dir=out_dir,
-                data_path=data_path,
-                method=method,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                max_batches=max_batches,
-                save_predictions=save_predictions,
-                summary=summary,
-                metrics_path=metrics_path,
-                train_npz=train_npz,
-                test_npz=test_npz,
-                step=epoch,
-                run_id=active_mlflow_run_id,
-                log_params=(epoch == start_epoch + 1),
-            )
-            print(f"MLflow run: {active_mlflow_run_id}")
-            print(f"MLflow tracking URI: file:{out_dir}/mlruns")
-
         _save_resume_state(
             resume_state_path,
             {
@@ -540,7 +444,6 @@ def run_interpolation(
                 "num_workers": num_workers,
                 "max_batches": max_batches,
                 "save_predictions": save_predictions,
-                "mlflow_run_id": active_mlflow_run_id,
             },
         )
         print(f"Saved resume state: {resume_state_path}")
@@ -581,17 +484,6 @@ def parse_args(argv: Optional[Iterable[str]] = None):
         default=None,
         help="Path to resume state JSON. Default: <out_dir>/interpolation_resume_state.json",
     )
-    parser.add_argument(
-        "--mlflow_run_id",
-        type=str,
-        default=None,
-        help="Existing MLflow run id to append metrics to while resuming.",
-    )
-    parser.add_argument(
-        "--no_mlflow",
-        action="store_true",
-        help="Disable MLflow logging (enabled by default).",
-    )
     return parser.parse_args(argv)
 
 
@@ -605,9 +497,7 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         max_batches=args.max_batches,
         save_predictions=args.save_predictions,
-        use_mlflow=not args.no_mlflow,
         epochs=args.epochs,
         resume=args.resume,
         resume_state_path=args.resume_state_path,
-        mlflow_run_id=args.mlflow_run_id,
     )

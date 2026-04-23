@@ -361,7 +361,7 @@ class DiffusionConfig:
     viscosity: float = 1e-3
     # Low-pass cutoff in angular wavenumber |k| for physics loss.
     # If None or <= 0, physics loss uses the full spectrum.
-    low_freq_k_cutoff: Optional[float] = 0.3
+    low_freq_k_cutoff: Optional[float] = 6
 
 
 class DDPMTrainer:
