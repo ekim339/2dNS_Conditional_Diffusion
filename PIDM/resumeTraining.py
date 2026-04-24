@@ -14,11 +14,23 @@ import os
 import sys
 from pathlib import Path
 
+def _find_project_root(start: Path) -> Path:
+    """
+    Find repo root containing PIDM/src by walking up from script location.
+    Works for both:
+      - <repo>/PIDM/resumeTraining.py
+      - <repo>/PIDM/src/resumeTraining.py
+    """
+    cur = start.resolve()
+    for candidate in [cur] + list(cur.parents):
+        if (candidate / "PIDM" / "src").is_dir():
+            return candidate
+    raise FileNotFoundError(f"Could not locate project root from {start}")
+
+
 # Project root: .../2dNS_Conditional_Diffusion
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_PROJECT_ROOT = _find_project_root(Path(__file__).resolve().parent)
 _PIDM_SRC = _PROJECT_ROOT / "PIDM" / "src"
-if not _PIDM_SRC.is_dir():
-    raise FileNotFoundError(f"Expected PIDM/src at {_PIDM_SRC}")
 sys.path.insert(0, str(_PIDM_SRC))
 
 from cfgConditional import run_training_resume  # noqa: E402
