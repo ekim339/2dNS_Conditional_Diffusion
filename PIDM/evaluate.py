@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from cfgConditional import (
+from model import (
     ConditionalDDPM,
     DDPMTrainer,
     DiffusionConfig,

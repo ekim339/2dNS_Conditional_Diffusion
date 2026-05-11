@@ -1,5 +1,5 @@
 # ============================================
-# Conditional DDPM (Sparse 8x8 -> Full 64x64)
+# Conditional DDPM (Full 64x64 -> Full 64x64)
 # Classifier-Free Guidance (CFG) in PyTorch
 #
 # Assumptions:
@@ -8,16 +8,16 @@
 # - Data are single-channel scalar fields (e.g., vorticity).
 #
 # What this does:
-# - Splits first 80% train, last 20% test (as requested).
-# - Creates sparse observations y in R^{8x8} by uniform subsampling (fixed grid).
+# - Splits first 80% train, last 20% test.
+# - Uses the full normalized 64x64 field as the conditioning signal y.
 # - Trains a conditional DDPM with CFG: randomly drops condition during training.
-# - Provides sampling with CFG to reconstruct 64x64 fields from 8x8 observations.
+# - Provides sampling with CFG to reconstruct 64x64 fields from 64x64 observations.
 #
 # Notes:
-# - This "directly encodes" the 8x8 into the network via a small conv encoder
-#   that produces an embedding used to FiLM-modulate U-Net ResBlocks.
-# - This does NOT enforce exact sensor consistency during sampling (pure CFG).
-#   (You can add a projection step if needed.)
+# - This "directly encodes" the 64x64 input via a conv encoder that produces an
+#   embedding used to FiLM-modulate U-Net ResBlocks.
+# - WARNING: when y == x0 the task is trivial; this layout is intended for cases
+#   where y is a degraded/noisy/low-res version of the field, etc.
 # ============================================
 
 import math
@@ -84,7 +84,7 @@ def extract(a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tens
 
 
 # -------------------------
-# Dataset: fixed split + fixed uniform sampling grid (8x8)
+# Dataset: fixed split, full 64x64 field used as both target x0 and condition y
 # -------------------------
 class NavierStokesSparseDataset(Dataset):
     def __init__(
@@ -92,11 +92,12 @@ class NavierStokesSparseDataset(Dataset):
         full_fields: torch.Tensor,  # (N, 64, 64)
         mean: float,
         std: float,
-        sensor_stride: int = 8,      # 64/8 = 8
+        sensor_stride: int = 8,  # kept for backward compat; not used
     ):
         """
-        We assume uniform sensor grid (8x8) over 64x64:
-          take pixels at [0, 8, 16, ..., 56] in each axis (stride=8).
+        Uses the full normalized 64x64 field as both the diffusion target x0 and
+        the conditioning signal y. `sensor_stride` is accepted for backward
+        compatibility but ignored.
         """
         assert full_fields.ndim == 3 and full_fields.shape[1] == 64 and full_fields.shape[2] == 64
         self.x = full_fields.float()
@@ -104,24 +105,16 @@ class NavierStokesSparseDataset(Dataset):
         self.std = float(std)
         self.sensor_stride = int(sensor_stride)
 
-        # Indices for uniform grid
-        coords = torch.arange(0, 64, self.sensor_stride)
-        assert len(coords) == 8, "Expected 8 points per axis for 8x8 sensors."
-        self.registered_coords = coords
-
     def __len__(self):
         return self.x.shape[0]
 
     def __getitem__(self, idx: int):
         x0 = self.x[idx]  # (64, 64)
-        # normalize
         x0 = (x0 - self.mean) / (self.std + 1e-8)
 
-        # get sparse observation y (8, 8) by uniform subsampling
-        c = self.registered_coords
-        y = x0[c][:, c]  # (8, 8)
+        y = x0  # full 64x64 field as condition
 
-        return x0.unsqueeze(0), y.unsqueeze(0)  # (1,64,64), (1,8,8)
+        return x0.unsqueeze(0), y.unsqueeze(0)  # (1,64,64), (1,64,64)
 
 
 # -------------------------
@@ -151,26 +144,32 @@ class SinusoidalTimeEmbedding(nn.Module):
 
 
 # -------------------------
-# Condition encoder: directly encode (1,8,8) -> embedding vector
+# Condition encoder: directly encode (1,64,64) -> embedding vector
 # -------------------------
-class CondEncoder8x8(nn.Module):
+class CondEncoderField64(nn.Module):
     def __init__(self, emb_dim: int):
         super().__init__()
-        # Very small conv encoder to preserve spatial structure
+        # Conv encoder: 64 -> 32 -> 16 -> 8 -> 4 -> 2, then global avg pool.
         self.net = nn.Sequential(
             nn.Conv2d(1, 32, 3, padding=1),
             nn.SiLU(),
-            nn.Conv2d(32, 64, 3, padding=1, stride=2),  # 8->4
+            nn.Conv2d(32, 64, 3, padding=1, stride=2),    # 64 -> 32
             nn.SiLU(),
-            nn.Conv2d(64, 128, 3, padding=1, stride=2), # 4->2
+            nn.Conv2d(64, 128, 3, padding=1, stride=2),   # 32 -> 16
+            nn.SiLU(),
+            nn.Conv2d(128, 128, 3, padding=1, stride=2),  # 16 -> 8
+            nn.SiLU(),
+            nn.Conv2d(128, 256, 3, padding=1, stride=2),  # 8 -> 4
+            nn.SiLU(),
+            nn.Conv2d(256, 256, 3, padding=1, stride=2),  # 4 -> 2
             nn.SiLU(),
             nn.AdaptiveAvgPool2d((1, 1)),
         )
-        self.proj = nn.Linear(128, emb_dim)
+        self.proj = nn.Linear(256, emb_dim)
 
     def forward(self, y: torch.Tensor) -> torch.Tensor:
         """
-        y: (B,1,8,8)
+        y: (B,1,64,64)
         returns: (B, emb_dim)
         """
         h = self.net(y).flatten(1)
@@ -301,7 +300,7 @@ class ConditionalDDPM(nn.Module):
             nn.Linear(emb_dim * 4, emb_dim),
         )
 
-        self.cond_enc = CondEncoder8x8(emb_dim)
+        self.cond_enc = CondEncoderField64(emb_dim)
         self.null_cond = nn.Parameter(torch.zeros(emb_dim))  # learned unconditional embedding
 
         self.unet = UNet64FiLM(base_ch=base_ch, emb_dim=emb_dim)
@@ -310,7 +309,7 @@ class ConditionalDDPM(nn.Module):
         """
         x_t: (B,1,64,64)
         t:   (B,) int64
-        y:   (B,1,8,8) or None for unconditional
+        y:   (B,1,64,64) or None for unconditional
         """
         et = self.time_mlp(self.time_emb(t))  # (B, emb_dim)
 
@@ -399,7 +398,7 @@ class DDPMTrainer:
         """
         CFG sampling:
           eps = eps_uncond + s*(eps_cond - eps_uncond)
-        y: (B,1,8,8)
+        y: (B,1,64,64)
         shape: (B,1,64,64)
         returns x0 samples (B,1,64,64)
         """
@@ -448,7 +447,7 @@ class DDPMTrainer:
 
         for batch_idx, (x0, y) in enumerate(loader):
             x0 = x0.to(self.device)  # (B,1,64,64)
-            y = y.to(self.device)    # (B,1,8,8)
+            y = y.to(self.device)    # (B,1,64,64)
 
             B = x0.size(0)
             t = torch.randint(0, self.cfg.T, (B,), device=self.device, dtype=torch.long)
@@ -956,19 +955,16 @@ def load_and_sample(
     x0 = test_full[idx]  # (B,64,64)
     x0n = (x0 - mean) / (std + 1e-8)
 
-    # build y (8,8)
-    coords = torch.arange(0, 64, 8)
-    y = x0n[:, coords][:, :, coords]  # (B,8,8)
+    # full 64x64 field as condition
+    y = x0n  # (B,64,64)
 
     x0n = x0n.unsqueeze(1).to(device)  # (B,1,64,64)
-    y = y.unsqueeze(1).to(device)      # (B,1,8,8)
+    y = y.unsqueeze(1).to(device)      # (B,1,64,64)
 
     xhat = trainer.sample_cfg(y=y, guidance_scale=guidance_scale, shape=(num_samples, 1, 64, 64))
-    # unnormalize to original scale
     xhat = xhat.squeeze(1) * (std + 1e-8) + mean  # (B,64,64)
-    x0 = x0  # original
 
-    return x0.cpu(), xhat.cpu(), y.squeeze(1).cpu()  # y is normalized 8x8
+    return x0.cpu(), xhat.cpu(), y.squeeze(1).cpu()  # y is normalized 64x64
 
 
 # Example:
