@@ -235,7 +235,7 @@ def compare_train_and_test_samples(
 
 if __name__ == "__main__":
     # Configuration
-    ckpt_path = "/Users/eugenekim/2dNS_Conditional_Diffusion/checkpoint/w=0.3p=0.1.pt"
+    ckpt_path = "/Users/eugenekim/2dNS_Conditional_Diffusion/checkpoint/sanitycheck.pt"
     data_path = "/Users/eugenekim/2dNS_Conditional_Diffusion/NSE_Data(Noisy).npy"
     guidance_scale = None  # None = use checkpoint's guidance_scale, or set explicitly (e.g., 4.0)
     

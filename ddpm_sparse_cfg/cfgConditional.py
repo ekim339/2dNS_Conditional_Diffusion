@@ -14,10 +14,10 @@
 # - Provides sampling with CFG to reconstruct 64x64 fields from 64x64 observations.
 #
 # Notes:
-# - This "directly encodes" the 64x64 input via a conv encoder that produces an
-#   embedding used to FiLM-modulate U-Net ResBlocks.
-# - WARNING: when y == x0 the task is trivial; this layout is intended for cases
-#   where y is a degraded/noisy/low-res version of the field, etc.
+# - The conditioning field y is concatenated with x_t along the channel dim
+#   to form a 2-channel input to the U-Net: model_input = cat([x_t, y], dim=1).
+# - FiLM modulation carries only the timestep embedding.
+# - For unconditional forward passes (CFG dropout), y is replaced with zeros.
 # ============================================
 
 import math
@@ -144,39 +144,6 @@ class SinusoidalTimeEmbedding(nn.Module):
 
 
 # -------------------------
-# Condition encoder: directly encode (1,64,64) -> embedding vector
-# -------------------------
-class CondEncoderField64(nn.Module):
-    def __init__(self, emb_dim: int):
-        super().__init__()
-        # Conv encoder: 64 -> 32 -> 16 -> 8 -> 4 -> 2, then global avg pool.
-        self.net = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(32, 64, 3, padding=1, stride=2),    # 64 -> 32
-            nn.SiLU(),
-            nn.Conv2d(64, 128, 3, padding=1, stride=2),   # 32 -> 16
-            nn.SiLU(),
-            nn.Conv2d(128, 128, 3, padding=1, stride=2),  # 16 -> 8
-            nn.SiLU(),
-            nn.Conv2d(128, 256, 3, padding=1, stride=2),  # 8 -> 4
-            nn.SiLU(),
-            nn.Conv2d(256, 256, 3, padding=1, stride=2),  # 4 -> 2
-            nn.SiLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-        )
-        self.proj = nn.Linear(256, emb_dim)
-
-    def forward(self, y: torch.Tensor) -> torch.Tensor:
-        """
-        y: (B,1,64,64)
-        returns: (B, emb_dim)
-        """
-        h = self.net(y).flatten(1)
-        return self.proj(h)
-
-
-# -------------------------
 # ResBlock with FiLM (AdaGN-like) conditioning
 # -------------------------
 class ResBlockFiLM(nn.Module):
@@ -222,7 +189,7 @@ class ResBlockFiLM(nn.Module):
 class UNet64FiLM(nn.Module):
     def __init__(self, base_ch: int = 64, emb_dim: int = 256):
         super().__init__()
-        self.in_conv = nn.Conv2d(1, base_ch, 3, padding=1)
+        self.in_conv = nn.Conv2d(2, base_ch, 3, padding=1)
 
         # Down
         self.rb1 = ResBlockFiLM(base_ch, base_ch, emb_dim)
@@ -254,7 +221,7 @@ class UNet64FiLM(nn.Module):
         self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
-        # x: (B,1,64,64)
+        # x: (B,2,64,64) — channel 0 = x_t, channel 1 = y (or zeros if unconditional)
         x = self.in_conv(x)
 
         h1 = self.rb1(x, emb)          # (B, base, 64,64)
@@ -300,26 +267,35 @@ class ConditionalDDPM(nn.Module):
             nn.Linear(emb_dim * 4, emb_dim),
         )
 
-        self.cond_enc = CondEncoderField64(emb_dim)
-        self.null_cond = nn.Parameter(torch.zeros(emb_dim))  # learned unconditional embedding
-
         self.unet = UNet64FiLM(base_ch=base_ch, emb_dim=emb_dim)
 
     def forward(self, x_t: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor]) -> torch.Tensor:
         """
         x_t: (B,1,64,64)
         t:   (B,) int64
-        y:   (B,1,64,64) or None for unconditional
+        y:   (B,1,64,64) or None
         """
-        et = self.time_mlp(self.time_emb(t))  # (B, emb_dim)
+        et = self.time_mlp(self.time_emb(t))
 
         if y is None:
+            # unconditional branch for CFG
             ey = self.null_cond[None, :].expand(x_t.size(0), -1)
+
+            # spatial null condition: all zeros
+            y_spatial = torch.zeros_like(x_t)
         else:
+            # conditional branch
             ey = self.cond_enc(y)
 
+            # spatial condition
+            y_spatial = y
+
         emb = et + ey
-        return self.unet(x_t, emb)
+
+        # concatenate noisy sample and condition spatially
+        x_in = torch.cat([x_t, y_spatial], dim=1)  # (B,2,64,64)
+
+        return self.unet(x_in, emb) # (B,1,64,64)
 
 
 # -------------------------
@@ -409,9 +385,10 @@ class DDPMTrainer:
             t = torch.full((shape[0],), i, device=self.device, dtype=torch.long)
 
             # unconditional and conditional eps
-            eps_u = self.model(x, t, None)
-            eps_c = self.model(x, t, y)
-            eps = eps_u + guidance_scale * (eps_c - eps_u)
+            # eps_u = self.model(x, t, None)
+            # eps_c = self.model(x, t, y)
+            # eps = eps_u + guidance_scale * (eps_c - eps_u)
+            eps = self.model(x, t, y)
 
             # compute mean/var using eps (manual to avoid double forward)
             sqrt_acp = extract(self.sqrt_alphas_cumprod, t, x.shape)
@@ -914,7 +891,7 @@ def run_training_resume(
 
 
 # -------------------------
-# Loading + sampling example (reconstruct full field from sparse y on test)
+# Loading + sampling example (reconstruct full field from 64x64 y on test)
 # -------------------------
 @torch.no_grad()
 def load_and_sample(
