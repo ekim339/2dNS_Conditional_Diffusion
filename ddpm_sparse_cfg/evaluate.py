@@ -336,7 +336,7 @@ if __name__ == "__main__":
     # This will create checkpoints in: /Users/eugenekim/2dNS_Conditional_Diffusion/checkpoint/
     
     # Default checkpoint path (created after training)
-    default_ckpt = "/Users/eugenekim/2dNS_Conditional_Diffusion/checkpoint/w=10p=0.1.pt"
+    default_ckpt = "/content/drive/MyDrive/Lab/CondDiff/best.pt"
     
     # Check if checkpoint exists, if not provide helpful message
     if not os.path.exists(default_ckpt):
@@ -354,7 +354,7 @@ if __name__ == "__main__":
     
     run_eval(
         ckpt_path=default_ckpt,  # Path to your trained checkpoint
-        data_path="/Users/eugenekim/2dNS_Conditional_Diffusion/NSE_Data(Noisy).npy",
+        data_path="/content/drive/MyDrive/Lab/CondDiff/NSE_Data(Noisy).npy",
         batch_size=16,         # DDPM sampling is slow; start small
         num_batches=5,         # increase if you can afford it
         guidance_scale=None,   # None = use checkpoint's guidance_scale, or set explicitly (e.g., 4.0)
