@@ -6,6 +6,10 @@ from cfgConditional import (
     default_device
 )
 
+# Must match training NavierStokesSparseDataset(..., sensor_stride=...)
+SENSOR_STRIDE = 8
+
+
 def generate_and_plot_sample(
     trainer,
     x0_true: torch.Tensor,
@@ -30,17 +34,19 @@ def generate_and_plot_sample(
         x0_true = x0_true.squeeze()
     assert x0_true.shape == (64, 64), f"Expected (64, 64), got {x0_true.shape}"
     
-    # Normalize (same as training dataset: y is full 64x64 field, matches cfgConditional concat)
+    # Normalized field + 2-channel cond [sparse field, mask] (same as NavierStokesSparseDataset)
     x0_true_norm = (x0_true - mean) / (std + 1e-8)
-    y_input = x0_true_norm.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 64, 64)
-    assert y_input.shape == (1, 1, 64, 64), f"Expected y_input (1, 1, 64, 64), got {y_input.shape}"
-    
+    mask = torch.zeros_like(x0_true_norm)
+    mask[::SENSOR_STRIDE, ::SENSOR_STRIDE] = 1.0
+    y_sparse = x0_true_norm * mask
+    cond = torch.stack([y_sparse, mask], dim=0).unsqueeze(0).to(device)  # (1, 2, 64, 64)
+
     # Generate single sample
     print("Generating sample...", end=" ", flush=True)
-    
+
     with torch.no_grad():
         x_pred_norm = trainer.sample_cfg(
-            y=y_input,
+            cond=cond,
             guidance_scale=guidance_scale,
             shape=(1, 1, 64, 64),
         )

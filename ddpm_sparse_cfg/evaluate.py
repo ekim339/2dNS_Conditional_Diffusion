@@ -3,10 +3,22 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from ConditionalDiffusion import (
-    ConditionalDDPM, DDPMTrainer, DiffusionConfig,
-    NavierStokesSparseDataset, default_device
-)
+try:
+    from cfgConditional import (
+        ConditionalDDPM,
+        DDPMTrainer,
+        DiffusionConfig,
+        NavierStokesSparseDataset,
+        default_device,
+    )
+except ImportError:  # Colab / alternate module name
+    from cfgConditional import (
+        ConditionalDDPM,
+        DDPMTrainer,
+        DiffusionConfig,
+        NavierStokesSparseDataset,
+        default_device,
+    )
 
 # --- import the classes from your training file ---
 # If your code is in train_sparse_ddpm.py, do:
@@ -20,18 +32,13 @@ from ConditionalDiffusion import (
 @torch.no_grad()
 def evaluate_on_test(trainer, test_loader, mean, std, num_batches=10, guidance_scale=4.0):
     """
-    Runs CFG sampling and reports:
+    Runs sampling and reports:
       - full-field MSE/MAE in original scale
-      - sensor MSE in original scale (12x12 grid)
+      - sensor MSE in original scale (mean squared error on mask==1 pixels only;
+        cond[:,1] is the binary sensor mask from NavierStokesSparseDataset)
     """
     device = trainer.device
     trainer.model.eval()
-
-    # Stride-5 “12” grid: arange(0, 64, 5) has 13 indices; use 0..55 for 12x12.
-    coords = torch.arange(0, 60, 5, device=device)
-
-    def H(x64):  # x64: (B,64,64)
-        return x64[:, coords][:, :, coords]  # (B,12,12)
 
     mse_list, mae_list, sensor_mse_list = [], [], []
     
@@ -50,13 +57,18 @@ def evaluate_on_test(trainer, test_loader, mean, std, num_batches=10, guidance_s
     total_samples = 0
     start_time = time.time()
 
-    for b, (x0_norm, y_norm) in enumerate(test_loader):
+    for b, batch in enumerate(test_loader):
         if num_batches is not None and b >= num_batches:
             break
 
         batch_start = time.time()
-        x0_norm = x0_norm.to(device)  # (B,1,64,64), normalized
-        y_norm  = y_norm.to(device)   # (B,1,12,12), normalized
+        if len(batch) >= 2:
+            x0_norm, cond_norm = batch[0], batch[1]
+        else:
+            raise ValueError("Expected batch (x0_norm, cond_norm); got unexpected format")
+
+        x0_norm = x0_norm.to(device)    # (B,1,64,64), normalized
+        cond_norm = cond_norm.to(device)  # (B,2,64,64): [sparse field, mask]
 
         B = x0_norm.size(0)
         total_samples += B
@@ -66,10 +78,9 @@ def evaluate_on_test(trainer, test_loader, mean, std, num_batches=10, guidance_s
         else:
             print(f"  Batch {b+1}/{len(test_loader)} | Batch size: {B} | Sampling...", end=" ", flush=True)
 
-        # reconstruct via CFG sampling
         sample_start = time.time()
         xhat_norm = trainer.sample_cfg(
-            y=y_norm,
+            cond=cond_norm,
             guidance_scale=guidance_scale,
             shape=(B, 1, 64, 64),
         )
@@ -82,9 +93,9 @@ def evaluate_on_test(trainer, test_loader, mean, std, num_batches=10, guidance_s
         mse = F.mse_loss(xhat, x0).item()
         mae = F.l1_loss(xhat, x0).item()
 
-        y_true = H(x0)
-        y_pred = H(xhat)
-        sensor_mse = F.mse_loss(y_pred, y_true).item()
+        mask = cond_norm[:, 1:2]  # (B,1,64,64)
+        diff_sq = (xhat - x0) ** 2 * mask.squeeze(1)
+        sensor_mse = (diff_sq.sum() / mask.sum().clamp(min=1e-8)).item()
 
         mse_list.append(mse)
         mae_list.append(mae)
@@ -232,8 +243,8 @@ def run_eval(ckpt_path: str, data_path: str, batch_size: int = 32, num_batches: 
     print(f"Preparing Evaluation DataLoaders")
     print(f"{'='*60}")
     
-    train_ds = NavierStokesSparseDataset(train_sampled, mean=mean, std=std, sensor_stride=5)
-    test_ds = NavierStokesSparseDataset(test_sampled, mean=mean, std=std, sensor_stride=5)
+    train_ds = NavierStokesSparseDataset(train_sampled, mean=mean, std=std, sensor_stride=8)
+    test_ds = NavierStokesSparseDataset(test_sampled, mean=mean, std=std, sensor_stride=8)
     
     train_loader = DataLoader(
         train_ds,

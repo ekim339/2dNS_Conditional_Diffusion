@@ -7,6 +7,9 @@ from cfgConditional import (
     default_device
 )
 
+SENSOR_STRIDE = 8
+
+
 def generate_and_plot_sample(
     trainer,
     x0_true: torch.Tensor,
@@ -27,26 +30,17 @@ def generate_and_plot_sample(
         x0_true = x0_true.squeeze()
     assert x0_true.shape == (64, 64), f"Expected (64, 64), got {x0_true.shape}"
     
-    # Normalize
+    # Normalized field + 2-channel cond [sparse field, mask] (same as NavierStokesSparseDataset)
     x0_true_norm = (x0_true - mean) / (std + 1e-8)
-    
-    # Build sparse observation y (12x12). Note: arange(0, 64, 5) yields 13 points (includes 60).
-    # Use arange(0, 60, 5) for exactly 12 samples at stride 5: 0,5,...,55.
-    coords = torch.arange(0, 60, 5, dtype=torch.long)
-    c = coords
-    y_sparse = x0_true_norm[c][:, c]  # (12, 12) - same as intended 12x12 dataset grid
-    
-    # Verify sparse observation shape and values
-    assert y_sparse.shape == (12, 12), f"Expected y_sparse shape (12, 12), got {y_sparse.shape}"
-    
-    # Prepare for model input
-    y_input = y_sparse.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 12, 12)
-    assert y_input.shape == (1, 1, 12, 12), f"Expected y_input shape (1, 1, 12, 12), got {y_input.shape}"
-    
+    mask = torch.zeros_like(x0_true_norm)
+    mask[::SENSOR_STRIDE, ::SENSOR_STRIDE] = 1.0
+    y_sparse = x0_true_norm * mask
+    cond = torch.stack([y_sparse, mask], dim=0).unsqueeze(0).to(device)  # (1, 2, 64, 64)
+
     print(f"Generating single sample ({title_prefix})...", end=" ", flush=True)
     with torch.no_grad():
         x_pred_norm = trainer.sample_cfg(
-            y=y_input,
+            cond=cond,
             guidance_scale=guidance_scale,
             shape=(1, 1, 64, 64),
         )
