@@ -275,27 +275,16 @@ class ConditionalDDPM(nn.Module):
         t:   (B,) int64
         y:   (B,1,64,64) or None
         """
-        et = self.time_mlp(self.time_emb(t))
+        emb = self.time_mlp(self.time_emb(t))
 
         if y is None:
-            # unconditional branch for CFG
-            ey = self.null_cond[None, :].expand(x_t.size(0), -1)
-
-            # spatial null condition: all zeros
             y_spatial = torch.zeros_like(x_t)
         else:
-            # conditional branch
-            ey = self.cond_enc(y)
-
-            # spatial condition
             y_spatial = y
 
-        emb = et + ey
-
-        # concatenate noisy sample and condition spatially
         x_in = torch.cat([x_t, y_spatial], dim=1)  # (B,2,64,64)
 
-        return self.unet(x_in, emb) # (B,1,64,64)
+        return self.unet(x_in, emb)
 
 
 # -------------------------
@@ -305,13 +294,13 @@ class ConditionalDDPM(nn.Module):
 class DiffusionConfig:
     T: int = 1000
     beta_schedule: str = "cosine"
-    drop_prob: float = 0.1     # CFG condition dropout probability
+    drop_prob: float = 0     # CFG condition dropout probability
     lr: float = 2e-4
     batch_size: int = 64
     num_workers: int = 0  # Set to 0 for macOS compatibility (multiprocessing issues)
     grad_clip: float = 1.0
     epochs: int = 10
-    guidance_scale: float = 10.0  # CFG sampling scale
+    guidance_scale: float = 1.0  # CFG sampling scale
     use_amp: bool = True
 
 
@@ -547,13 +536,13 @@ def run_training(
     cfg = DiffusionConfig(
         T=1000,
         beta_schedule="cosine",
-        drop_prob=0.1,
+        drop_prob=0,
         lr=2e-4,
         batch_size=64,
         num_workers=0,  # Set to 0 for macOS compatibility (multiprocessing issues)
         grad_clip=1.0,
         epochs=10,
-        guidance_scale=4.0,
+        guidance_scale=1.0,
         use_amp=True,
     )
 
