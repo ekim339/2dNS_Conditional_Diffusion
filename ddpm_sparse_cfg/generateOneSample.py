@@ -30,20 +30,10 @@ def generate_and_plot_sample(
         x0_true = x0_true.squeeze()
     assert x0_true.shape == (64, 64), f"Expected (64, 64), got {x0_true.shape}"
     
-    # Normalize
+    # Normalize (same as training dataset: y is full 64x64 field, matches cfgConditional concat)
     x0_true_norm = (x0_true - mean) / (std + 1e-8)
-    
-    # 12x12 grid at stride 5: arange(0, 64, 5) is 13 points; use 0..55 only.
-    coords = torch.arange(0, 60, 5, dtype=torch.long)
-    c = coords
-    y_sparse = x0_true_norm[c][:, c]  # (12, 12)
-    
-    # Verify sparse observation shape and values
-    assert y_sparse.shape == (12, 12), f"Expected y_sparse shape (12, 12), got {y_sparse.shape}"
-    
-    # Prepare for model input
-    y_input = y_sparse.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 12, 12)
-    assert y_input.shape == (1, 1, 12, 12), f"Expected y_input shape (1, 1, 12, 12), got {y_input.shape}"
+    y_input = x0_true_norm.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 64, 64)
+    assert y_input.shape == (1, 1, 64, 64), f"Expected y_input (1, 1, 64, 64), got {y_input.shape}"
     
     # Generate single sample
     print("Generating sample...", end=" ", flush=True)
@@ -235,7 +225,7 @@ def compare_train_and_test_samples(
 
 if __name__ == "__main__":
     # Configuration
-    ckpt_path = "/Users/eugenekim/2dNS_Conditional_Diffusion/checkpoint/sanitycheck.pt"
+    ckpt_path = "/Users/eugenekim/2dNS_Conditional_Diffusion/checkpoint/fullfield.pt"
     data_path = "/Users/eugenekim/2dNS_Conditional_Diffusion/NSE_Data(Noisy).npy"
     guidance_scale = None  # None = use checkpoint's guidance_scale, or set explicitly (e.g., 4.0)
     
