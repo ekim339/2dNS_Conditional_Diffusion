@@ -89,17 +89,16 @@ def extract(a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tens
 class NavierStokesSparseDataset(Dataset):
     def __init__(
         self,
-        full_fields: torch.Tensor,  # (N, 64, 64)
+        full_fields: torch.Tensor,   # (N, 64, 64)
         mean: float,
         std: float,
-        sensor_stride: int = 8,  # kept for backward compat; not used
+        sensor_stride: int = 8,
     ):
         """
-        Uses the full normalized 64x64 field as both the diffusion target x0 and
-        the conditioning signal y. `sensor_stride` is accepted for backward
-        compatibility but ignored.
+        sensor_stride=8 on a 64x64 grid gives an 8x8 observation lattice
+        (i.e. 64 observed points total).
         """
-        assert full_fields.ndim == 3 and full_fields.shape[1] == 64 and full_fields.shape[2] == 64
+        assert full_fields.ndim == 3 and full_fields.shape[1:] == (64, 64)
         self.x = full_fields.float()
         self.mean = float(mean)
         self.std = float(std)
@@ -109,13 +108,20 @@ class NavierStokesSparseDataset(Dataset):
         return self.x.shape[0]
 
     def __getitem__(self, idx: int):
-        x0 = self.x[idx]  # (64, 64)
+        x0 = self.x[idx]  # (64,64)
         x0 = (x0 - self.mean) / (self.std + 1e-8)
 
-        y = x0  # full 64x64 field as condition
+        # 8x8 sparse sensor mask on 64x64 grid
+        mask = torch.zeros_like(x0)
+        mask[::self.sensor_stride, ::self.sensor_stride] = 1.0
 
-        return x0.unsqueeze(0), y.unsqueeze(0)  # (1,64,64), (1,64,64)
+        # sparse observed field
+        y_sparse = x0 * mask
 
+        # condition has 2 channels: [sparse field, mask]
+        cond = torch.stack([y_sparse, mask], dim=0)   # (2,64,64)
+
+        return x0.unsqueeze(0), cond   # x0: (1,64,64), cond: (2,64,64)
 
 # -------------------------
 # Time embedding
@@ -189,7 +195,7 @@ class ResBlockFiLM(nn.Module):
 class UNet64FiLM(nn.Module):
     def __init__(self, base_ch: int = 64, emb_dim: int = 256):
         super().__init__()
-        self.in_conv = nn.Conv2d(2, base_ch, 3, padding=1)
+        self.in_conv = nn.Conv2d(3, base_ch, 3, padding=1)
 
         # Down
         self.rb1 = ResBlockFiLM(base_ch, base_ch, emb_dim)
@@ -221,7 +227,10 @@ class UNet64FiLM(nn.Module):
         self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
-        # x: (B,2,64,64) — channel 0 = x_t, channel 1 = y (or zeros if unconditional)
+        # x: (B,3,64,64)
+        # channel 0 = x_t
+        # channel 1 = sparse observed field
+        # channel 2 = binary mask
         x = self.in_conv(x)
 
         h1 = self.rb1(x, emb)          # (B, base, 64,64)
@@ -269,20 +278,24 @@ class ConditionalDDPM(nn.Module):
 
         self.unet = UNet64FiLM(base_ch=base_ch, emb_dim=emb_dim)
 
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor, cond: Optional[torch.Tensor]) -> torch.Tensor:
         """
-        x_t: (B,1,64,64)
-        t:   (B,) int64
-        y:   (B,1,64,64) or None
+        x_t:  (B,1,64,64)
+        t:    (B,) int64
+        cond: (B,2,64,64) or None
+            cond[:,0] = sparse observed field
+            cond[:,1] = binary mask
         """
         emb = self.time_mlp(self.time_emb(t))
 
-        if y is None:
-            y_spatial = torch.zeros_like(x_t)
-        else:
-            y_spatial = y
+        B, _, H, W = x_t.shape
 
-        x_in = torch.cat([x_t, y_spatial], dim=1)  # (B,2,64,64)
+        if cond is None:
+            cond_spatial = torch.zeros(B, 2, H, W, device=x_t.device, dtype=x_t.dtype)
+        else:
+            cond_spatial = cond
+
+        x_in = torch.cat([x_t, cond_spatial], dim=1)  # (B,3,64,64)
 
         return self.unet(x_in, emb)
 
@@ -359,7 +372,7 @@ class DDPMTrainer:
         return mean, var
 
     @torch.no_grad()
-    def sample_cfg(self, y: torch.Tensor, guidance_scale: float, shape: Tuple[int, int, int, int]) -> torch.Tensor:
+    def sample_cfg(self, cond: torch.Tensor, guidance_scale: float, shape: Tuple[int, int, int, int]) -> torch.Tensor:
         """
         CFG sampling:
           eps = eps_uncond + s*(eps_cond - eps_uncond)
@@ -377,7 +390,7 @@ class DDPMTrainer:
             # eps_u = self.model(x, t, None)
             # eps_c = self.model(x, t, y)
             # eps = eps_u + guidance_scale * (eps_c - eps_u)
-            eps = self.model(x, t, y)
+            eps = self.model(x, t, cond)
 
             # compute mean/var using eps (manual to avoid double forward)
             sqrt_acp = extract(self.sqrt_alphas_cumprod, t, x.shape)
@@ -411,9 +424,9 @@ class DDPMTrainer:
         
         print(f"  Starting epoch {epoch} ({num_batches} batches)...")
 
-        for batch_idx, (x0, y) in enumerate(loader):
+        for batch_idx, (x0, cond) in enumerate(loader):
             x0 = x0.to(self.device)  # (B,1,64,64)
-            y = y.to(self.device)    # (B,1,64,64)
+            cond = cond.to(self.device)    # (B,1,64,64)
 
             B = x0.size(0)
             t = torch.randint(0, self.cfg.T, (B,), device=self.device, dtype=torch.long)
@@ -436,7 +449,7 @@ class DDPMTrainer:
                 denom = 0
 
                 if idx_c.numel() > 0:
-                    eps_pred_c = self.model(x_t[idx_c], t[idx_c], y[idx_c])
+                    eps_pred_c = self.model(x_t[idx_c], t[idx_c], cond[idx_c])
                     loss_c = F.mse_loss(eps_pred_c, noise[idx_c])
                     loss = loss + loss_c * idx_c.numel()
                     denom += idx_c.numel()
@@ -476,13 +489,13 @@ class DDPMTrainer:
         """
         self.model.eval()
         mses = []
-        for i, (x0, y) in enumerate(loader):
+        for i, (x0, cond) in enumerate(loader):
             if i >= num_batches:
                 break
             x0 = x0.to(self.device)
-            y = y.to(self.device)
+            cond = cond.to(self.device)
             B = x0.size(0)
-            x_hat = self.sample_cfg(y=y, guidance_scale=self.cfg.guidance_scale, shape=(B, 1, 64, 64))
+            x_hat = self.sample_cfg(cond=cond, guidance_scale=self.cfg.guidance_scale, shape=(B, 1, 64, 64))
             mse = F.mse_loss(x_hat, x0).item()
             mses.append(mse)
         return float(np.mean(mses)) if mses else float("nan")
@@ -883,15 +896,16 @@ def run_training_resume(
 # Loading + sampling example (reconstruct full field from 64x64 y on test)
 # -------------------------
 @torch.no_grad()
+@torch.no_grad()
 def load_and_sample(
     ckpt_path: str,
-    data,  # same shape (N,64,64) to pull test examples from
+    data,
     num_samples: int = 8,
-    guidance_scale: float = 4.0,
+    guidance_scale: float = 1.0,
+    sensor_stride: int = 8,
 ):
     device = default_device()
 
-    # load checkpoint
     ckpt = torch.load(ckpt_path, map_location=device)
     cfg_dict = ckpt["cfg"]
     T = cfg_dict["T"]
@@ -900,15 +914,14 @@ def load_and_sample(
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    # re-create diffusion wrapper
     cfg = DiffusionConfig(**cfg_dict)
     trainer = DDPMTrainer(model, cfg, device)
 
-    # prepare test split as requested: last 20%
     if isinstance(data, np.ndarray):
         data_t = torch.from_numpy(data)
     else:
         data_t = data
+
     N = data_t.shape[0]
     n_train = int(0.8 * N)
     test_full = data_t[n_train:].float()
@@ -916,21 +929,26 @@ def load_and_sample(
     mean = ckpt["train_mean"]
     std = ckpt["train_std"]
 
-    # pick some random test examples
     idx = torch.randint(0, test_full.shape[0], (num_samples,))
-    x0 = test_full[idx]  # (B,64,64)
-    x0n = (x0 - mean) / (std + 1e-8)
+    x0 = test_full[idx]                        # (B,64,64)
+    x0n = (x0 - mean) / (std + 1e-8)          # normalized
 
-    # full 64x64 field as condition
-    y = x0n  # (B,64,64)
+    mask = torch.zeros_like(x0n)
+    mask[:, ::sensor_stride, ::sensor_stride] = 1.0   # 8x8 lattice if stride=8
 
-    x0n = x0n.unsqueeze(1).to(device)  # (B,1,64,64)
-    y = y.unsqueeze(1).to(device)      # (B,1,64,64)
+    y_sparse = x0n * mask
+    cond = torch.stack([y_sparse, mask], dim=1)       # (B,2,64,64)
 
-    xhat = trainer.sample_cfg(y=y, guidance_scale=guidance_scale, shape=(num_samples, 1, 64, 64))
-    xhat = xhat.squeeze(1) * (std + 1e-8) + mean  # (B,64,64)
+    xhat = trainer.sample_cfg(cond=cond.to(device),
+                              guidance_scale=guidance_scale,
+                              shape=(num_samples, 1, 64, 64))
 
-    return x0.cpu(), xhat.cpu(), y.squeeze(1).cpu()  # y is normalized 64x64
+    xhat = xhat.squeeze(1) * (std + 1e-8) + mean
+
+    # optional: return sparse observation on original scale for plotting
+    y_sparse_denorm = y_sparse * (std + 1e-8) + mean * mask
+
+    return x0.cpu(), xhat.cpu(), y_sparse_denorm.cpu(), mask.cpu()
 
 
 # Example:
