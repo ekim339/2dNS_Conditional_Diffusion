@@ -324,10 +324,10 @@ class DiffusionConfig:
     batch_size: int = 64
     num_workers: int = 0  # Set to 0 for macOS compatibility (multiprocessing issues)
     grad_clip: float = 1.0
-    epochs: int = 10
+    epochs: int = 30
     guidance_scale: float = 1.0  # CFG sampling scale
     use_amp: bool = True
-    lambda_phys: float = 1e-6
+    lambda_phys: float = 1e-7
     dt_phys: float = 1e-3
     viscosity: float = 1e-3
     # Low-pass cutoff in angular wavenumber |k| for physics loss (None = full spectrum).
@@ -525,8 +525,8 @@ class DDPMTrainer:
         total_phys_loss = 0.0
         n = 0
         num_batches = len(loader)
-        lambda_smooth_space = 1e-7
-        lambda_smooth_time = 1e-7
+        lambda_smooth_space = 5e-4
+        lambda_smooth_time = 5e-5
 
         print(f"  Starting epoch {epoch} ({num_batches} batches)...")
 
