@@ -456,19 +456,19 @@ class DDPMTrainer:
         u = torch.fft.irfft2(1j * ky * psi_fft, s=(H, W))
         v = torch.fft.irfft2(-1j * kx * psi_fft, s=(H, W))
 
-        u = torch.clamp(u, -10.0, 10.0)
-        v = torch.clamp(v, -10.0, 10.0)
+        #u = torch.clamp(u, -10.0, 10.0)
+        #v = torch.clamp(v, -10.0, 10.0)
 
         # --- Spatial derivatives of ω ---
         w_x = torch.fft.irfft2(1j * kx * w_fft, s=(H, W))
         w_y = torch.fft.irfft2(1j * ky * w_fft, s=(H, W))
 
-        w_x = torch.clamp(w_x, -100.0, 100.0)
-        w_y = torch.clamp(w_y, -100.0, 100.0)
+        #w_x = torch.clamp(w_x, -100.0, 100.0)
+        #w_y = torch.clamp(w_y, -100.0, 100.0)
 
         # --- Laplacian ---
         lap_fft = -(kx**2 + ky**2) * w_fft
-        lap_fft = torch.clamp(lap_fft.real, -1e6, 1e6) + 1j * torch.clamp(lap_fft.imag, -1e6, 1e6)
+        #lap_fft = torch.clamp(lap_fft.real, -1e6, 1e6) + 1j * torch.clamp(lap_fft.imag, -1e6, 1e6)
         lap_w = torch.fft.irfft2(lap_fft, s=(H, W))
 
         # --- Time derivative ---
@@ -557,7 +557,7 @@ class DDPMTrainer:
         total_phys_loss = 0.0
         n = 0
         num_batches = len(loader)
-        
+
         print(f"  Starting epoch {epoch} ({num_batches} batches)...")
 
         for batch_idx, (omega_prev, x0, omega_next, y_prev, y, y_next) in enumerate(loader):
@@ -612,7 +612,7 @@ class DDPMTrainer:
                     # center prediction w_hat^k
                     eps_pred_center = self.model(x_t[idx_c], t_c, y[idx_c])
                     x0_pred = (x_t[idx_c] - sqrt_om * eps_pred_center) / (sqrt_acp + 1e-8)
-                    x0_pred = torch.clamp(x0_pred, -200.0, 200.0)
+                    #x0_pred = torch.clamp(x0_pred, -200.0, 200.0)
 
                     # neighbor predictions w_hat^{k-1}, w_hat^{k+1}
                     noise_prev = torch.randn_like(omega_prev[idx_c])
@@ -625,18 +625,16 @@ class DDPMTrainer:
 
                     x_prev_pred = (x_t_prev - sqrt_om * eps_pred_prev) / (sqrt_acp + 1e-8)
                     x_next_pred = (x_t_next - sqrt_om * eps_pred_next) / (sqrt_acp + 1e-8)
-                    x_prev_pred = torch.clamp(x_prev_pred, -200.0, 200.0)
-                    x_next_pred = torch.clamp(x_next_pred, -200.0, 200.0)
+                    #x_prev_pred = torch.clamp(x_prev_pred, -200.0, 200.0)
+                    #x_next_pred = torch.clamp(x_next_pred, -200.0, 200.0)
 
                     # de-normalize
                     scale = self.data_std + 1e-8
                     x0_phys = x0_pred * scale + self.data_mean
-                    #x0_phys = torch.clamp(x0_phys, -10.0, 10.0)
                     omega_prev_phys = x_prev_pred * scale + self.data_mean
                     omega_next_phys = x_next_pred * scale + self.data_mean
 
                     residual = self.pde_residual(omega_prev_phys, x0_phys, omega_next_phys)
-                    # residual = torch.clamp(residual, -200.0, 200.0)
                     loss_phys = F.smooth_l1_loss(residual, torch.zeros_like(residual))
                 else:
                     loss_phys = torch.tensor(0.0, device=x_t.device)

@@ -413,16 +413,16 @@ class DDPMTrainer:
 
         u = torch.fft.irfft2(1j * ky * psi_fft, s=(H, W))
         v = torch.fft.irfft2(-1j * kx * psi_fft, s=(H, W))
-        u = torch.clamp(u, -10.0, 10.0)
-        v = torch.clamp(v, -10.0, 10.0)
+        #u = torch.clamp(u, -10.0, 10.0)
+        #v = torch.clamp(v, -10.0, 10.0)
 
         w_x = torch.fft.irfft2(1j * kx * w_fft, s=(H, W))
         w_y = torch.fft.irfft2(1j * ky * w_fft, s=(H, W))
-        w_x = torch.clamp(w_x, -100.0, 100.0)
-        w_y = torch.clamp(w_y, -100.0, 100.0)
+        #w_x = torch.clamp(w_x, -100.0, 100.0)
+        #w_y = torch.clamp(w_y, -100.0, 100.0)
 
         lap_fft = -(kx**2 + ky**2) * w_fft
-        lap_fft = torch.clamp(lap_fft.real, -1e6, 1e6) + 1j * torch.clamp(lap_fft.imag, -1e6, 1e6)
+        #lap_fft = torch.clamp(lap_fft.real, -1e6, 1e6) + 1j * torch.clamp(lap_fft.imag, -1e6, 1e6)
         lap_w = torch.fft.irfft2(lap_fft, s=(H, W))
 
         w_t = (w_next - w_prev) / (2.0 * dt)
@@ -501,6 +501,23 @@ class DDPMTrainer:
 
         return x
 
+    def spatial_smoothness_loss(self, w):
+        """
+        w: (B, 1, H, W)
+        Penalizes nonsmooth behavior in x and y directions.
+        """
+        dx = w[:, :, :, 1:] - w[:, :, :, :-1]
+        dy = w[:, :, 1:, :] - w[:, :, :-1, :]
+        return (dx ** 2).mean() + (dy ** 2).mean()
+
+    def temporal_second_difference_loss(self, w_prev, w_cur, w_next):
+        """
+        Penalizes nonsmooth acceleration in time:
+        w_{k+1} - 2w_k + w_{k-1}
+        """
+        dtt = w_next - 2.0 * w_cur + w_prev
+        return (dtt ** 2).mean()
+
     def train_one_epoch(self, loader: DataLoader, epoch: int):
         self.model.train()
         total_loss = 0.0
@@ -508,6 +525,8 @@ class DDPMTrainer:
         total_phys_loss = 0.0
         n = 0
         num_batches = len(loader)
+        lambda_smooth_space = 1e-6
+        lambda_smooth_time = 1e-6
 
         print(f"  Starting epoch {epoch} ({num_batches} batches)...")
 
@@ -555,7 +574,7 @@ class DDPMTrainer:
 
                     eps_pred_center = self.model(x_t[idx_c], t_c, cond[idx_c])
                     x0_pred = (x_t[idx_c] - sqrt_om * eps_pred_center) / (sqrt_acp + 1e-8)
-                    x0_pred = torch.clamp(x0_pred, -200.0, 200.0)
+                    #x0_pred = torch.clamp(x0_pred, -200.0, 200.0)
 
                     noise_prev = torch.randn_like(omega_prev[idx_c])
                     noise_next = torch.randn_like(omega_next[idx_c])
@@ -567,20 +586,46 @@ class DDPMTrainer:
 
                     x_prev_pred = (x_t_prev - sqrt_om * eps_pred_prev) / (sqrt_acp + 1e-8)
                     x_next_pred = (x_t_next - sqrt_om * eps_pred_next) / (sqrt_acp + 1e-8)
-                    x_prev_pred = torch.clamp(x_prev_pred, -200.0, 200.0)
-                    x_next_pred = torch.clamp(x_next_pred, -200.0, 200.0)
+                    #x_prev_pred = torch.clamp(x_prev_pred, -200.0, 200.0)
+                    #x_next_pred = torch.clamp(x_next_pred, -200.0, 200.0)
 
                     scale = self.data_std + 1e-8
                     x0_phys = x0_pred * scale + self.data_mean
                     omega_prev_phys = x_prev_pred * scale + self.data_mean
                     omega_next_phys = x_next_pred * scale + self.data_mean
 
+                     # spatial smoothness loss
+                    loss_smooth_space = self.spatial_smoothness_loss(x0_phys)
+                    # temporal smoothness loss
+                    loss_smooth_time = self.temporal_second_difference_loss(omega_prev_phys, x0_phys, omega_next_phys)
+
                     residual = self.pde_residual(omega_prev_phys, x0_phys, omega_next_phys)
                     loss_phys = F.mse_loss(residual, torch.zeros_like(residual))
                 else:
                     loss_phys = torch.tensor(0.0, device=x_t.device)
+                    loss_smooth_space = torch.tensor(0.0, device=x_t.device)
+                    loss_smooth_time = torch.tensor(0.0, device=x_t.device)
 
-                loss = loss_diff + self.cfg.lambda_phys * loss_phys
+                if loss_phys.item() > 1e6:
+                    print(
+                        f"    Batch {batch_idx + 1}/{num_batches} | "
+                        f"Loss: {loss.item():.6f} | "
+                        f"Diff: {loss_diff.item():.6f} | "
+                        f"Phys: {loss_phys.item():.6f} | "
+                        f"Space: {loss_smooth_space.item():.6f} | "
+                        f"TimeAccel: {loss_smooth_time.item():.6f} | "
+                        f"Avg Loss: {current_avg_loss:.6f} | "
+                        f"Avg Diff: {current_avg_diff:.6f} | "
+                        f"Avg Phys: {current_avg_phys:.6f}"
+                    )
+                    #print("high freq:", self.high_freq_loss(x0_phys).item())
+
+                loss = (
+                            loss_diff
+                            + self.cfg.lambda_phys * loss_phys
+                            + lambda_smooth_space * loss_smooth_space
+                            + lambda_smooth_time * loss_smooth_time
+                        )
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     print(f"Skipping bad batch at batch {batch_idx + 1}")
