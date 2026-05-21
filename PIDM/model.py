@@ -327,7 +327,7 @@ class DiffusionConfig:
     epochs: int = 10
     guidance_scale: float = 1.0  # CFG sampling scale
     use_amp: bool = True
-    lambda_phys: float = 5e-5
+    lambda_phys: float = 1e-6
     dt_phys: float = 1e-3
     viscosity: float = 1e-3
     # Low-pass cutoff in angular wavenumber |k| for physics loss (None = full spectrum).
@@ -525,8 +525,8 @@ class DDPMTrainer:
         total_phys_loss = 0.0
         n = 0
         num_batches = len(loader)
-        lambda_smooth_space = 1e-6
-        lambda_smooth_time = 1e-6
+        lambda_smooth_space = 1e-7
+        lambda_smooth_time = 1e-7
 
         print(f"  Starting epoch {epoch} ({num_batches} batches)...")
 
@@ -611,7 +611,7 @@ class DDPMTrainer:
                     loss_smooth_time = torch.tensor(0.0, device=x_t.device)
                     residual = None
 
-                if loss_phys.item() > 1e6:
+                if loss_phys.item() > 1e8:
                     with torch.no_grad():
                         print("\n" + "=" * 80)
                         print(f"Large physics loss detected at epoch {epoch}, batch {batch_idx + 1}/{num_batches}")
