@@ -655,9 +655,12 @@ class DDPMTrainer:
 
                         print("=" * 80 + "\n")
 
+                weighted_phys = self.cfg.lambda_phys * loss_phys
+                weighted_phys = torch.clamp(weighted_phys, max=5.0)
+
                 loss = (
                             loss_diff
-                            + self.cfg.lambda_phys * loss_phys
+                            + weighted_phys
                             + lambda_smooth_space * loss_smooth_space
                             + lambda_smooth_time * loss_smooth_time
                         )
