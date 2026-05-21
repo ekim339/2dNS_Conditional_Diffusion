@@ -567,7 +567,7 @@ class DDPMTrainer:
 
                 loss_diff = loss / max(denom, 1)
 
-                phys_t_max = 100  # try 100 first; if still unstable, try 50
+                phys_t_max = 100 
                 idx_phys = idx_c[t[idx_c] < phys_t_max] if idx_c.numel() > 0 else idx_c
 
                 if idx_phys.numel() > 0:
