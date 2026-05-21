@@ -567,37 +567,41 @@ class DDPMTrainer:
 
                 loss_diff = loss / max(denom, 1)
 
-                if idx_c.numel() > 0:
-                    t_c = t[idx_c]
-                    sqrt_acp = extract(self.sqrt_alphas_cumprod, t, x_t.shape)[idx_c]
-                    sqrt_om = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)[idx_c]
+                phys_t_max = 100  # try 100 first; if still unstable, try 50
+                idx_phys = idx_c[t[idx_c] < phys_t_max] if idx_c.numel() > 0 else idx_c
 
-                    eps_pred_center = self.model(x_t[idx_c], t_c, cond[idx_c])
-                    x0_pred = (x_t[idx_c] - sqrt_om * eps_pred_center) / (sqrt_acp + 1e-8)
-                    #x0_pred = torch.clamp(x0_pred, -200.0, 200.0)
+                if idx_phys.numel() > 0:
+                    t_p = t[idx_phys]
 
-                    noise_prev = torch.randn_like(omega_prev[idx_c])
-                    noise_next = torch.randn_like(omega_next[idx_c])
-                    x_t_prev = self.q_sample(omega_prev[idx_c], t_c, noise_prev)
-                    x_t_next = self.q_sample(omega_next[idx_c], t_c, noise_next)
+                    sqrt_acp = extract(self.sqrt_alphas_cumprod, t, x_t.shape)[idx_phys]
+                    sqrt_om = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)[idx_phys]
 
-                    eps_pred_prev = self.model(x_t_prev, t_c, cond_prev[idx_c])
-                    eps_pred_next = self.model(x_t_next, t_c, cond_next[idx_c])
+                    eps_pred_center = self.model(x_t[idx_phys], t_p, cond[idx_phys])
+                    x0_pred = (x_t[idx_phys] - sqrt_om * eps_pred_center) / (sqrt_acp + 1e-8)
+
+                    noise_prev = torch.randn_like(omega_prev[idx_phys])
+                    noise_next = torch.randn_like(omega_next[idx_phys])
+
+                    x_t_prev = self.q_sample(omega_prev[idx_phys], t_p, noise_prev)
+                    x_t_next = self.q_sample(omega_next[idx_phys], t_p, noise_next)
+
+                    eps_pred_prev = self.model(x_t_prev, t_p, cond_prev[idx_phys])
+                    eps_pred_next = self.model(x_t_next, t_p, cond_next[idx_phys])
 
                     x_prev_pred = (x_t_prev - sqrt_om * eps_pred_prev) / (sqrt_acp + 1e-8)
                     x_next_pred = (x_t_next - sqrt_om * eps_pred_next) / (sqrt_acp + 1e-8)
-                    #x_prev_pred = torch.clamp(x_prev_pred, -200.0, 200.0)
-                    #x_next_pred = torch.clamp(x_next_pred, -200.0, 200.0)
 
                     scale = self.data_std + 1e-8
                     x0_phys = x0_pred * scale + self.data_mean
                     omega_prev_phys = x_prev_pred * scale + self.data_mean
                     omega_next_phys = x_next_pred * scale + self.data_mean
 
-                     # spatial smoothness loss
                     loss_smooth_space = self.spatial_smoothness_loss(x0_phys)
-                    # temporal smoothness loss
-                    loss_smooth_time = self.temporal_second_difference_loss(omega_prev_phys, x0_phys, omega_next_phys)
+                    loss_smooth_time = self.temporal_second_difference_loss(
+                        omega_prev_phys,
+                        x0_phys,
+                        omega_next_phys,
+                    )
 
                     residual = self.pde_residual(omega_prev_phys, x0_phys, omega_next_phys)
                     loss_phys = F.mse_loss(residual, torch.zeros_like(residual))
@@ -605,7 +609,7 @@ class DDPMTrainer:
                     loss_phys = torch.tensor(0.0, device=x_t.device)
                     loss_smooth_space = torch.tensor(0.0, device=x_t.device)
                     loss_smooth_time = torch.tensor(0.0, device=x_t.device)
-                    #print("high freq:", self.high_freq_loss(x0_phys).item())
+                    residual = None
 
                 if loss_phys.item() > 1e6:
                     with torch.no_grad():
