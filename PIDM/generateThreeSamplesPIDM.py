@@ -6,13 +6,14 @@ import torch
 import matplotlib.pyplot as plt
 
 _PIDM_ROOT = Path(__file__).resolve().parent
-_SRC = _PIDM_ROOT / "src"
-sys.path.insert(0, str(_SRC))
+sys.path.insert(0, str(_PIDM_ROOT))
 
 from model import (
     ConditionalDDPM, DDPMTrainer, DiffusionConfig,
     default_device
 )
+
+SENSOR_STRIDE = 8
 
 def _diffusion_config_from_ckpt(cfg_dict: dict) -> DiffusionConfig:
     fields = set(DiffusionConfig.__dataclass_fields__.keys())
@@ -38,25 +39,17 @@ def generate_and_plot_sample(
         x0_true = x0_true.squeeze()
     assert x0_true.shape == (64, 64), f"Expected (64, 64), got {x0_true.shape}"
     
-    # Normalize
+    # Normalized field + 2-channel cond [sparse field, mask] (same as NavierStokesSparseDataset)
     x0_true_norm = (x0_true - mean) / (std + 1e-8)
-    
-    # Build sparse observation y (8x8) for PIDM.
-    coords = torch.arange(0, 64, 8, dtype=torch.long)
-    c = coords
-    y_sparse = x0_true_norm[c][:, c]  # (8, 8)
-    
-    # Verify sparse observation shape and values
-    assert y_sparse.shape == (8, 8), f"Expected y_sparse shape (8, 8), got {y_sparse.shape}"
-    
-    # Prepare for model input
-    y_input = y_sparse.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 8, 8)
-    assert y_input.shape == (1, 1, 8, 8), f"Expected y_input shape (1, 1, 8, 8), got {y_input.shape}"
-    
+    mask = torch.zeros_like(x0_true_norm)
+    mask[::SENSOR_STRIDE, ::SENSOR_STRIDE] = 1.0
+    y_sparse = x0_true_norm * mask
+    cond = torch.stack([y_sparse, mask], dim=0).unsqueeze(0).to(device)  # (1, 2, 64, 64)
+
     print(f"Generating single sample ({title_prefix})...", end=" ", flush=True)
     with torch.no_grad():
         x_pred_norm = trainer.sample_cfg(
-            y=y_input,
+            cond=cond,
             guidance_scale=guidance_scale,
             shape=(1, 1, 64, 64),
         )
@@ -76,7 +69,7 @@ def generate_and_plot_sample(
     return x_true, x_pred, diff, mse, mae
 
 
-def _add_sparse_grid_lines(ax, stride: int = 8, n: int = 64):
+def _add_sparse_grid_lines(ax, stride: int = SENSOR_STRIDE, n: int = 64):
     """Dashed lines for coarse 8x8 sensor grid on 64x64 fields."""
     for i in range(1, n // stride):
         ax.axvline(x=i * stride - 0.5, color="white", linewidth=0.8, alpha=0.55, linestyle="--")
@@ -203,7 +196,7 @@ def compare_train_and_test_samples(
     model.eval()
     
     cfg = _diffusion_config_from_ckpt(cfg_dict)
-    trainer = DDPMTrainer(model, cfg, device)
+    trainer = DDPMTrainer(model, cfg, device, data_mean=mean, data_std=std)
 
     train_rows = []
     for idx in train_indices:
@@ -278,7 +271,7 @@ def compare_train_and_test_samples(
 
 if __name__ == "__main__":
     #Configuration
-    ckpt_path = "/Users/eugenekim/2dNS_Conditional_Diffusion/checkpoint/PIDM k=2.pt"
+    ckpt_path = "/Users/eugenekim/2dNS_Conditional_Diffusion/checkpoint/best (1).pt"
     data_path = "/Users/eugenekim/2dNS_Conditional_Diffusion/NSE_Data(Noisy).npy"
     guidance_scale = None  # None = use checkpoint's guidance_scale, or set explicitly (e.g., 4.0)
     
