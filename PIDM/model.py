@@ -327,7 +327,7 @@ class DiffusionConfig:
     epochs: int = 30
     guidance_scale: float = 1.0  # CFG sampling scale
     use_amp: bool = True
-    lambda_phys: float = 1e-7
+    lambda_phys: float = 1e-8
     dt_phys: float = 1e-3
     viscosity: float = 1e-3
     # Low-pass cutoff in angular wavenumber |k| for physics loss (None = full spectrum).
