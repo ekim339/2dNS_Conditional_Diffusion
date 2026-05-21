@@ -576,7 +576,7 @@ class DDPMTrainer:
                     omega_next_phys = x_next_pred * scale + self.data_mean
 
                     residual = self.pde_residual(omega_prev_phys, x0_phys, omega_next_phys)
-                    loss_phys = F.smooth_l1_loss(residual, torch.zeros_like(residual))
+                    loss_phys = F.mse_loss(residual, torch.zeros_like(residual))
                 else:
                     loss_phys = torch.tensor(0.0, device=x_t.device)
 
