@@ -619,6 +619,8 @@ class DDPMTrainer:
 
                         print(f"loss_diff:        {loss_diff.item():.6e}")
                         print(f"loss_phys:        {loss_phys.item():.6e}")
+                        print(f"loss_phys weighted raw: {weighted_phys_raw.item():.6e}")
+                        print(f"loss_phys weighted cap: {weighted_phys.item():.6e}")
                         print(f"loss_smooth_space:{loss_smooth_space.item():.6e}")
                         print(f"loss_smooth_time: {loss_smooth_time.item():.6e}")
 
