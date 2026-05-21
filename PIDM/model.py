@@ -605,20 +605,51 @@ class DDPMTrainer:
                     loss_phys = torch.tensor(0.0, device=x_t.device)
                     loss_smooth_space = torch.tensor(0.0, device=x_t.device)
                     loss_smooth_time = torch.tensor(0.0, device=x_t.device)
+                    #print("high freq:", self.high_freq_loss(x0_phys).item())
 
                 if loss_phys.item() > 1e6:
-                    print(
-                        f"    Batch {batch_idx + 1}/{num_batches} | "
-                        f"Loss: {loss.item():.6f} | "
-                        f"Diff: {loss_diff.item():.6f} | "
-                        f"Phys: {loss_phys.item():.6f} | "
-                        f"Space: {loss_smooth_space.item():.6f} | "
-                        f"TimeAccel: {loss_smooth_time.item():.6f} | "
-                        f"Avg Loss: {current_avg_loss:.6f} | "
-                        f"Avg Diff: {current_avg_diff:.6f} | "
-                        f"Avg Phys: {current_avg_phys:.6f}"
-                    )
-                    #print("high freq:", self.high_freq_loss(x0_phys).item())
+                    with torch.no_grad():
+                        print("\n" + "=" * 80)
+                        print(f"Large physics loss detected at epoch {epoch}, batch {batch_idx + 1}/{num_batches}")
+                        print("=" * 80)
+
+                        print(f"loss_diff:        {loss_diff.item():.6e}")
+                        print(f"loss_phys:        {loss_phys.item():.6e}")
+                        print(f"loss_smooth_space:{loss_smooth_space.item():.6e}")
+                        print(f"loss_smooth_time: {loss_smooth_time.item():.6e}")
+
+                        print("\nResidual stats:")
+                        print(f"  residual abs mean: {residual.abs().mean().item():.6e}")
+                        print(f"  residual abs max:  {residual.abs().max().item():.6e}")
+
+                        print("\nPrediction field stats:")
+                        for name, w in [
+                            ("omega_prev_phys", omega_prev_phys),
+                            ("x0_phys", x0_phys),
+                            ("omega_next_phys", omega_next_phys),
+                        ]:
+                            print(
+                                f"  {name}: "
+                                f"mean={w.mean().item():.6e}, "
+                                f"std={w.std().item():.6e}, "
+                                f"min={w.min().item():.6e}, "
+                                f"max={w.max().item():.6e}, "
+                                f"absmax={w.abs().max().item():.6e}"
+                            )
+
+                        print("\nTemporal jump stats:")
+                        dt_prev = x0_phys - omega_prev_phys
+                        dt_next = omega_next_phys - x0_phys
+                        dtt = omega_next_phys - 2.0 * x0_phys + omega_prev_phys
+
+                        print(f"  |x0 - prev| mean: {dt_prev.abs().mean().item():.6e}")
+                        print(f"  |x0 - prev| max:  {dt_prev.abs().max().item():.6e}")
+                        print(f"  |next - x0| mean: {dt_next.abs().mean().item():.6e}")
+                        print(f"  |next - x0| max:  {dt_next.abs().max().item():.6e}")
+                        print(f"  |dtt| mean:       {dtt.abs().mean().item():.6e}")
+                        print(f"  |dtt| max:        {dtt.abs().max().item():.6e}")
+
+                        print("=" * 80 + "\n")
 
                 loss = (
                             loss_diff
@@ -649,10 +680,16 @@ class DDPMTrainer:
                 current_avg_diff = total_diff_loss / max(n, 1)
                 current_avg_phys = total_phys_loss / max(n, 1)
                 print(
-                    f"    Batch {batch_idx + 1}/{num_batches} | "
-                    f"Loss: {loss.item():.6f} | Diff: {loss_diff.item():.6f} | Phys: {loss_phys.item():.6f} | "
-                    f"Avg Loss: {current_avg_loss:.6f} | Avg Diff: {current_avg_diff:.6f} | Avg Phys: {current_avg_phys:.6f}"
-                )
+                        f"    Batch {batch_idx + 1}/{num_batches} | "
+                        f"Loss: {loss.item():.6f} | "
+                        f"Diff: {loss_diff.item():.6f} | "
+                        f"Phys: {loss_phys.item():.6f} | "
+                        f"Space: {loss_smooth_space.item():.6f} | "
+                        f"TimeAccel: {loss_smooth_time.item():.6f} | "
+                        #f"Avg Loss: {current_avg_loss:.6f} | "
+                        f"Avg Diff: {current_avg_diff:.6f} | "
+                        f"Avg Phys: {current_avg_phys:.6f}"
+                    )
 
         avg_loss = total_loss / max(n, 1)
         avg_diff_loss = total_diff_loss / max(n, 1)
