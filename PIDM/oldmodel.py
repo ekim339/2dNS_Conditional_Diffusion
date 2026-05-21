@@ -1,27 +1,31 @@
 # ============================================
-# PIDM: Physics-Informed Conditional DDPM (Sparse 8x8 -> Full 64x64)
+# Conditional DDPM (Sparse 8x8 -> Full 64x64)
 # Classifier-Free Guidance (CFG) in PyTorch
 #
 # Assumptions:
-# - `data` is a NumPy array or torch Tensor of shape (N, 64, 64) (vorticity).
+# - You already have `data` as a NumPy array or torch Tensor of shape (N, 64, 64),
+#   e.g. N=100000, dtype float32 (or convertible).
+# - Data are single-channel scalar fields (e.g., vorticity).
 #
 # What this does:
-# - Splits first 80% train, last 20% test.
-# - Sparse 8x8 observations on a fixed grid (stride=8) + binary mask condition.
-# - Trains conditional DDPM with optional CFG dropout.
-# - Physics loss: predict vorticity at k-1, k, k+1 and penalize the 2D NS
-#   vorticity residual (central time derivative + spectral advection/diffusion).
+# - Splits first 80% train, last 20% test (as requested).
+# - Creates sparse observations y in R^{8x8} by uniform subsampling (fixed grid).
+# - Trains a conditional DDPM with CFG: randomly drops condition during training.
+# - Provides sampling with CFG to reconstruct 64x64 fields from 8x8 observations.
 #
 # Notes:
-# - U-Net input: cat([x_t, sparse_field, mask], dim=1) -> 3 channels.
-# - FiLM modulation uses only the diffusion timestep embedding.
+# - This "directly encodes" the 8x8 into the network via a small conv encoder
+#   that produces an embedding used to FiLM-modulate U-Net ResBlocks.
+# - This does NOT enforce exact sensor consistency during sampling (pure CFG).
+#   (You can add a projection step if needed.)
 # ============================================
 
 import math
 import os
 import time
+from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -81,59 +85,62 @@ def extract(a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tens
 
 
 # -------------------------
-# Dataset: fixed split, full 64x64 field used as both target x0 and condition y
+# Dataset: fixed split + fixed uniform sampling grid (8x8)
 # -------------------------
 class NavierStokesSparseDataset(Dataset):
     def __init__(
         self,
-        full_fields: torch.Tensor,   # (N, 64, 64)
+        full_fields: torch.Tensor,  # (N, 64, 64)
         mean: float,
         std: float,
-        sensor_stride: int = 8,
+        sensor_stride: int = 8,      # 64/8 = 8
     ):
         """
-        sensor_stride=8 on a 64x64 grid gives an 8x8 observation lattice
-        (i.e. 64 observed points total).
-
-        Returns consecutive triplets (k-1, k, k+1) for PIDM physics loss.
+        We assume uniform sensor grid (8x8) over 64x64:
+          take pixels at [0, 8, 16, ..., 56] in each axis (stride=8).
         """
-        assert full_fields.ndim == 3 and full_fields.shape[1:] == (64, 64)
+        assert full_fields.ndim == 3 and full_fields.shape[1] == 64 and full_fields.shape[2] == 64
         self.x = full_fields.float()
         self.mean = float(mean)
         self.std = float(std)
         self.sensor_stride = int(sensor_stride)
 
+        # Indices for uniform grid
+        coords = torch.arange(0, 64, self.sensor_stride)
+        assert len(coords) == 8, "Expected 8 points per axis for 8x8 sensors."
+        self.registered_coords = coords
+
     def __len__(self):
-        # centers k must have both temporal neighbors
+        # use only centers that have both temporal neighbors (k-1, k+1)
         return max(0, self.x.shape[0] - 2)
 
-    def _normalize(self, field: torch.Tensor) -> torch.Tensor:
-        return (field - self.mean) / (self.std + 1e-8)
-
-    def _sparse_cond(self, field_norm: torch.Tensor) -> torch.Tensor:
-        mask = torch.zeros_like(field_norm)
-        mask[::self.sensor_stride, ::self.sensor_stride] = 1.0
-        y_sparse = field_norm * mask
-        return torch.stack([y_sparse, mask], dim=0)  # (2, 64, 64)
-
     def __getitem__(self, idx: int):
+        # shift by +1 so center index k is in [1, N-2]
         k = idx + 1
-        x_prev = self._normalize(self.x[k - 1])
-        x0 = self._normalize(self.x[k])
-        x_next = self._normalize(self.x[k + 1])
+        x_prev = self.x[k - 1]
+        x0 = self.x[k]
+        x_next = self.x[k + 1]
 
-        cond_prev = self._sparse_cond(x_prev)
-        cond = self._sparse_cond(x0)
-        cond_next = self._sparse_cond(x_next)
+        # normalize with training stats
+        x_prev = (x_prev - self.mean) / (self.std + 1e-8)
+        x0 = (x0 - self.mean) / (self.std + 1e-8)
+        x_next = (x_next - self.mean) / (self.std + 1e-8)
+
+        # get sparse observations y_prev, y, y_next (8, 8) by uniform subsampling
+        c = self.registered_coords
+        y_prev = x_prev[c][:, c]  # (8, 8)
+        y = x0[c][:, c]  # (8, 8)
+        y_next = x_next[c][:, c]  # (8, 8)
 
         return (
             x_prev.unsqueeze(0),
             x0.unsqueeze(0),
             x_next.unsqueeze(0),
-            cond_prev,
-            cond,
-            cond_next,
+            y_prev.unsqueeze(0),
+            y.unsqueeze(0),
+            y_next.unsqueeze(0),
         )
+
 
 # -------------------------
 # Time embedding
@@ -159,6 +166,33 @@ class SinusoidalTimeEmbedding(nn.Module):
         if self.dim % 2 == 1:
             emb = F.pad(emb, (0, 1))
         return emb
+
+
+# -------------------------
+# Condition encoder: directly encode (1,8,8) -> embedding vector
+# -------------------------
+class CondEncoder8x8(nn.Module):
+    def __init__(self, emb_dim: int):
+        super().__init__()
+        # Very small conv encoder to preserve spatial structure
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(32, 64, 3, padding=1, stride=2),  # 8->4
+            nn.SiLU(),
+            nn.Conv2d(64, 128, 3, padding=1, stride=2), # 4->2
+            nn.SiLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.proj = nn.Linear(128, emb_dim)
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        y: (B,1,8,8)
+        returns: (B, emb_dim)
+        """
+        h = self.net(y).flatten(1)
+        return self.proj(h)
 
 
 # -------------------------
@@ -207,7 +241,7 @@ class ResBlockFiLM(nn.Module):
 class UNet64FiLM(nn.Module):
     def __init__(self, base_ch: int = 64, emb_dim: int = 256):
         super().__init__()
-        self.in_conv = nn.Conv2d(3, base_ch, 3, padding=1)
+        self.in_conv = nn.Conv2d(1, base_ch, 3, padding=1)
 
         # Down
         self.rb1 = ResBlockFiLM(base_ch, base_ch, emb_dim)
@@ -239,10 +273,7 @@ class UNet64FiLM(nn.Module):
         self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
-        # x: (B,3,64,64)
-        # channel 0 = x_t
-        # channel 1 = sparse observed field
-        # channel 2 = binary mask
+        # x: (B,1,64,64)
         x = self.in_conv(x)
 
         h1 = self.rb1(x, emb)          # (B, base, 64,64)
@@ -288,28 +319,26 @@ class ConditionalDDPM(nn.Module):
             nn.Linear(emb_dim * 4, emb_dim),
         )
 
+        self.cond_enc = CondEncoder8x8(emb_dim)
+        self.null_cond = nn.Parameter(torch.zeros(emb_dim))  # learned unconditional embedding
+
         self.unet = UNet64FiLM(base_ch=base_ch, emb_dim=emb_dim)
 
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor, cond: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor]) -> torch.Tensor:
         """
-        x_t:  (B,1,64,64)
-        t:    (B,) int64
-        cond: (B,2,64,64) or None
-            cond[:,0] = sparse observed field
-            cond[:,1] = binary mask
+        x_t: (B,1,64,64)
+        t:   (B,) int64
+        y:   (B,1,8,8) or None for unconditional
         """
-        emb = self.time_mlp(self.time_emb(t))
+        et = self.time_mlp(self.time_emb(t))  # (B, emb_dim)
 
-        B, _, H, W = x_t.shape
-
-        if cond is None:
-            cond_spatial = torch.zeros(B, 2, H, W, device=x_t.device, dtype=x_t.dtype)
+        if y is None:
+            ey = self.null_cond[None, :].expand(x_t.size(0), -1)
         else:
-            cond_spatial = cond
+            ey = self.cond_enc(y)
 
-        x_in = torch.cat([x_t, cond_spatial], dim=1)  # (B,3,64,64)
-
-        return self.unet(x_in, emb)
+        emb = et + ey
+        return self.unet(x_t, emb)
 
 
 # -------------------------
@@ -324,25 +353,19 @@ class DiffusionConfig:
     batch_size: int = 64
     num_workers: int = 0  # Set to 0 for macOS compatibility (multiprocessing issues)
     grad_clip: float = 1.0
-    epochs: int = 10
+    epochs: int = 30
     guidance_scale: float = 1.0  # CFG sampling scale
     use_amp: bool = True
     lambda_phys: float = 5e-5
     dt_phys: float = 1e-3
     viscosity: float = 1e-3
-    # Low-pass cutoff in angular wavenumber |k| for physics loss (None = full spectrum).
-    low_freq_k_cutoff: Optional[float] = 2.0
+    # Low-pass cutoff in angular wavenumber |k| for physics loss.
+    # If None or <= 0, physics loss uses the full spectrum.
+    low_freq_k_cutoff: Optional[float] = 2
 
 
 class DDPMTrainer:
-    def __init__(
-        self,
-        model: ConditionalDDPM,
-        cfg: DiffusionConfig,
-        device: torch.device,
-        data_mean: float = 0.0,
-        data_std: float = 1.0,
-    ):
+    def __init__(self, model: ConditionalDDPM, cfg: DiffusionConfig, device: torch.device, data_mean: float = 0.0, data_std: float = 1.0):
         self.model = model.to(device)
         self.cfg = cfg
         self.device = device
@@ -367,6 +390,14 @@ class DDPMTrainer:
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=cfg.lr)
         self.scaler = torch.cuda.amp.GradScaler(enabled=(cfg.use_amp and device.type == "cuda"))
 
+        # Fourier grid for spectral derivatives in physics residual.
+        n = 64
+        k = (2 * math.pi) * torch.fft.fftfreq(n, device=device)
+        self.kx = k.view(-1, 1).repeat(1, n)
+        self.ky = k.view(1, -1).repeat(n, 1)
+        self.k2_safe = (self.kx**2 + self.ky**2).clone()
+        self.k2_safe[0, 0] = 1.0
+
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         return extract(self.sqrt_alphas_cumprod, t, x0.shape) * x0 + \
                extract(self.sqrt_one_minus_alphas_cumprod, t, x0.shape) * noise
@@ -378,13 +409,17 @@ class DDPMTrainer:
         omega_k_plus_1: torch.Tensor,
     ) -> torch.Tensor:
         """
-        2D incompressible Navier-Stokes vorticity residual:
+        2D incompressible Navier–Stokes vorticity residual:
             dω/dt + u * dω/dx + v * dω/dy - ν * ∇²ω
-        Uses central difference in time and spectral spatial derivatives (FFT).
+        Uses:
+            - central difference in time
+            - spectral derivatives (FFT)
         """
+
         dt = self.dt
         nu = self.cfg.viscosity
 
+        # (B, 1, H, W) -> (B, H, W)
         w_prev = omega_k_minus_1.squeeze(1)
         w_cur = omega_k.squeeze(1)
         w_next = omega_k_plus_1.squeeze(1)
@@ -392,9 +427,12 @@ class DDPMTrainer:
         B, H, W = w_cur.shape
         device = w_cur.device
 
-        kx = (2 * math.pi) * torch.fft.fftfreq(H, device=device).view(H, 1)
-        ky = (2 * math.pi) * torch.fft.rfftfreq(W, device=device).view(1, W // 2 + 1)
+        # --- Correct frequency grids for rfft2 ---
+        kx = (2 * math.pi) * torch.fft.fftfreq(H, device=device).view(H, 1)       # (H, 1)
+        ky = (2 * math.pi) * torch.fft.rfftfreq(W, device=device).view(1, W // 2 + 1)  # (1, W//2+1)
 
+        # --- Optional low-pass filtering for physics residual ---
+        # Compute residual on omega_low = ifft(fft(omega) * mask_low).
         k2 = kx**2 + ky**2
         k_cutoff = self.cfg.low_freq_k_cutoff
         if k_cutoff is not None and k_cutoff > 0:
@@ -403,31 +441,43 @@ class DDPMTrainer:
             w_cur = torch.fft.irfft2(torch.fft.rfft2(w_cur) * low_mask, s=(H, W))
             w_next = torch.fft.irfft2(torch.fft.rfft2(w_next) * low_mask, s=(H, W))
 
-        w_fft = torch.fft.rfft2(w_cur)
-        k2_safe = k2.clone()
-        k2_safe[0, 0] = 1.0
+        # --- FFT ---
+        w_fft = torch.fft.rfft2(w_cur)  # (B, H, W//2 + 1)
 
+        # --- k^2 ---
+        k2[0, 0] = 1.0  # avoid division by zero
+
+        # --- Solve Poisson: ∇²ψ = -ω ---
         eps = 1e-6
-        psi_fft = -w_fft / (k2_safe + eps)
+        psi_fft = -w_fft / (k2 + eps)
         psi_fft[..., 0, 0] = 0.0
 
+        # --- Velocity field ---
         u = torch.fft.irfft2(1j * ky * psi_fft, s=(H, W))
         v = torch.fft.irfft2(-1j * kx * psi_fft, s=(H, W))
+
         u = torch.clamp(u, -10.0, 10.0)
         v = torch.clamp(v, -10.0, 10.0)
 
+        # --- Spatial derivatives of ω ---
         w_x = torch.fft.irfft2(1j * kx * w_fft, s=(H, W))
         w_y = torch.fft.irfft2(1j * ky * w_fft, s=(H, W))
+
         w_x = torch.clamp(w_x, -100.0, 100.0)
         w_y = torch.clamp(w_y, -100.0, 100.0)
 
+        # --- Laplacian ---
         lap_fft = -(kx**2 + ky**2) * w_fft
         lap_fft = torch.clamp(lap_fft.real, -1e6, 1e6) + 1j * torch.clamp(lap_fft.imag, -1e6, 1e6)
         lap_w = torch.fft.irfft2(lap_fft, s=(H, W))
 
+        # --- Time derivative ---
         w_t = (w_next - w_prev) / (2.0 * dt)
+
+        # --- Residual ---
         R = w_t + u * w_x + v * w_y - nu * lap_w
-        return R.unsqueeze(1)
+
+        return R.unsqueeze(1)  # (B,1,H,W)
 
     def p_mean_variance(self, x_t: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -457,11 +507,11 @@ class DDPMTrainer:
         return mean, var
 
     @torch.no_grad()
-    def sample_cfg(self, cond: torch.Tensor, guidance_scale: float, shape: Tuple[int, int, int, int]) -> torch.Tensor:
+    def sample_cfg(self, y: torch.Tensor, guidance_scale: float, shape: Tuple[int, int, int, int]) -> torch.Tensor:
         """
         CFG sampling:
           eps = eps_uncond + s*(eps_cond - eps_uncond)
-        y: (B,1,64,64)
+        y: (B,1,8,8)
         shape: (B,1,64,64)
         returns x0 samples (B,1,64,64)
         """
@@ -472,10 +522,9 @@ class DDPMTrainer:
             t = torch.full((shape[0],), i, device=self.device, dtype=torch.long)
 
             # unconditional and conditional eps
-            # eps_u = self.model(x, t, None)
-            # eps_c = self.model(x, t, y)
-            # eps = eps_u + guidance_scale * (eps_c - eps_u)
-            eps = self.model(x, t, cond)
+            eps_u = self.model(x, t, None)
+            eps_c = self.model(x, t, y)
+            eps = eps_u + guidance_scale * (eps_c - eps_u)
 
             # compute mean/var using eps (manual to avoid double forward)
             sqrt_acp = extract(self.sqrt_alphas_cumprod, t, x.shape)
@@ -508,26 +557,31 @@ class DDPMTrainer:
         total_phys_loss = 0.0
         n = 0
         num_batches = len(loader)
-
+        
         print(f"  Starting epoch {epoch} ({num_batches} batches)...")
 
-        for batch_idx, (omega_prev, x0, omega_next, cond_prev, cond, cond_next) in enumerate(loader):
-            omega_prev = omega_prev.to(self.device)
-            x0 = x0.to(self.device)
-            omega_next = omega_next.to(self.device)
-            cond_prev = cond_prev.to(self.device)
-            cond = cond.to(self.device)
-            cond_next = cond_next.to(self.device)
+        for batch_idx, (omega_prev, x0, omega_next, y_prev, y, y_next) in enumerate(loader):
+            omega_prev = omega_prev.to(self.device)  # (B,1,64,64)
+            x0 = x0.to(self.device)  # (B,1,64,64)
+            omega_next = omega_next.to(self.device)  # (B,1,64,64)
+            y_prev = y_prev.to(self.device)  # (B,1,8,8)
+            y = y.to(self.device)    # (B,1,8,8)
+            y_next = y_next.to(self.device)  # (B,1,8,8)
 
             B = x0.size(0)
             t = torch.randint(0, self.cfg.T, (B,), device=self.device, dtype=torch.long)
             noise = torch.randn_like(x0)
             x_t = self.q_sample(x0, t, noise)
 
+            # CFG dropout
             cond_mask = (torch.rand(B, device=self.device) > self.cfg.drop_prob)
+            # If dropped, pass y=None for those samples.
+            # We'll do it in two batches for simplicity and correctness.
+
             self.opt.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(enabled=(self.cfg.use_amp and self.device.type == "cuda")):
+                # conditional subset
                 idx_c = torch.nonzero(cond_mask, as_tuple=False).squeeze(1)
                 idx_u = torch.nonzero(~cond_mask, as_tuple=False).squeeze(1)
 
@@ -535,7 +589,7 @@ class DDPMTrainer:
                 denom = 0
 
                 if idx_c.numel() > 0:
-                    eps_pred_c = self.model(x_t[idx_c], t[idx_c], cond[idx_c])
+                    eps_pred_c = self.model(x_t[idx_c], t[idx_c], y[idx_c])
                     loss_c = F.mse_loss(eps_pred_c, noise[idx_c])
                     loss = loss + loss_c * idx_c.numel()
                     denom += idx_c.numel()
@@ -548,40 +602,48 @@ class DDPMTrainer:
 
                 loss_diff = loss / max(denom, 1)
 
+                # Physics loss with sampled/predicted reconstructions at k-1, k, k+1.
                 if idx_c.numel() > 0:
                     t_c = t[idx_c]
+
                     sqrt_acp = extract(self.sqrt_alphas_cumprod, t, x_t.shape)[idx_c]
                     sqrt_om = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)[idx_c]
 
-                    eps_pred_center = self.model(x_t[idx_c], t_c, cond[idx_c])
+                    # center prediction w_hat^k
+                    eps_pred_center = self.model(x_t[idx_c], t_c, y[idx_c])
                     x0_pred = (x_t[idx_c] - sqrt_om * eps_pred_center) / (sqrt_acp + 1e-8)
                     x0_pred = torch.clamp(x0_pred, -200.0, 200.0)
 
+                    # neighbor predictions w_hat^{k-1}, w_hat^{k+1}
                     noise_prev = torch.randn_like(omega_prev[idx_c])
                     noise_next = torch.randn_like(omega_next[idx_c])
                     x_t_prev = self.q_sample(omega_prev[idx_c], t_c, noise_prev)
                     x_t_next = self.q_sample(omega_next[idx_c], t_c, noise_next)
 
-                    eps_pred_prev = self.model(x_t_prev, t_c, cond_prev[idx_c])
-                    eps_pred_next = self.model(x_t_next, t_c, cond_next[idx_c])
+                    eps_pred_prev = self.model(x_t_prev, t_c, y_prev[idx_c])
+                    eps_pred_next = self.model(x_t_next, t_c, y_next[idx_c])
 
                     x_prev_pred = (x_t_prev - sqrt_om * eps_pred_prev) / (sqrt_acp + 1e-8)
                     x_next_pred = (x_t_next - sqrt_om * eps_pred_next) / (sqrt_acp + 1e-8)
                     x_prev_pred = torch.clamp(x_prev_pred, -200.0, 200.0)
                     x_next_pred = torch.clamp(x_next_pred, -200.0, 200.0)
 
+                    # de-normalize
                     scale = self.data_std + 1e-8
                     x0_phys = x0_pred * scale + self.data_mean
+                    #x0_phys = torch.clamp(x0_phys, -10.0, 10.0)
                     omega_prev_phys = x_prev_pred * scale + self.data_mean
                     omega_next_phys = x_next_pred * scale + self.data_mean
 
                     residual = self.pde_residual(omega_prev_phys, x0_phys, omega_next_phys)
+                    # residual = torch.clamp(residual, -200.0, 200.0)
                     loss_phys = F.smooth_l1_loss(residual, torch.zeros_like(residual))
                 else:
                     loss_phys = torch.tensor(0.0, device=x_t.device)
 
                 loss = loss_diff + self.cfg.lambda_phys * loss_phys
 
+                # skip bad batches
                 if torch.isnan(loss) or torch.isinf(loss):
                     print(f"Skipping bad batch at batch {batch_idx + 1}")
                     print(f"  Diff: {loss_diff.item()} | Phys: {loss_phys.item()}")
@@ -598,7 +660,8 @@ class DDPMTrainer:
             total_diff_loss += float(loss_diff.item()) * B
             total_phys_loss += float(loss_phys.item()) * B
             n += B
-
+            
+            # Print progress every 10% of batches or every 10 batches, whichever is more frequent
             if (batch_idx + 1) % max(1, num_batches // 10) == 0 or (batch_idx + 1) % 10 == 0:
                 current_avg_loss = total_loss / max(n, 1)
                 current_avg_diff = total_diff_loss / max(n, 1)
@@ -626,16 +689,37 @@ class DDPMTrainer:
         """
         self.model.eval()
         mses = []
-        for i, (_, x0, _, _, cond, _) in enumerate(loader):
+        for i, (_, x0, _, _, y, _) in enumerate(loader):
             if i >= num_batches:
                 break
             x0 = x0.to(self.device)
-            cond = cond.to(self.device)
+            y = y.to(self.device)
             B = x0.size(0)
-            x_hat = self.sample_cfg(cond=cond, guidance_scale=self.cfg.guidance_scale, shape=(B, 1, 64, 64))
+            x_hat = self.sample_cfg(y=y, guidance_scale=self.cfg.guidance_scale, shape=(B, 1, 64, 64))
             mse = F.mse_loss(x_hat, x0).item()
             mses.append(mse)
         return float(np.mean(mses)) if mses else float("nan")
+
+
+def _diffusion_config_from_ckpt(cfg_dict: dict) -> DiffusionConfig:
+    fields = set(DiffusionConfig.__dataclass_fields__.keys())
+    return DiffusionConfig(**{k: v for k, v in cfg_dict.items() if k in fields})
+
+
+def _next_mlflow_step(run_id: str, tracking_uri: str, metric_keys=("train_loss", "test_recon_mse")) -> int:
+    """
+    Return next step index for resumed MLflow logging.
+    """
+    client = MlflowClient(tracking_uri=tracking_uri)
+    max_step = -1
+    for key in metric_keys:
+        try:
+            hist = client.get_metric_history(run_id, key)
+            if hist:
+                max_step = max(max_step, max(m.step for m in hist))
+        except Exception:
+            continue
+    return max_step + 1
 
 
 # -------------------------
@@ -691,7 +775,7 @@ def run_training(
         batch_size=64,
         num_workers=0,  # Set to 0 for macOS compatibility (multiprocessing issues)
         grad_clip=1.0,
-        epochs=10,
+        epochs=30,
         guidance_scale=1.0,
         use_amp=True,
     )
@@ -733,9 +817,9 @@ def run_training(
 
     # ---- MLflow setup ----
     mlflow.set_tracking_uri(f"file:{out_dir}/mlruns")  # simplest: store runs next to your checkpoints
-    mlflow.set_experiment("pidm_2dns")
+    mlflow.set_experiment("conditional_ddpm_2dns")
 
-    with mlflow.start_run(run_name="pidm_sparse_conditional_ddpm"):
+    with mlflow.start_run(run_name="cfg_conditional_ddpm"):
         run_id = mlflow.active_run().info.run_id
         # log hyperparameters
         mlflow.log_params(cfg.__dict__)
@@ -748,15 +832,15 @@ def run_training(
         for epoch in range(1, cfg.epochs + 1):
             t0 = time.time()
             train_loss, train_loss_data, train_loss_physics = trainer.train_one_epoch(train_loader, epoch)
-
+            
             ckpt = {
                 "model": trainer.model.state_dict(),
                 "cfg": cfg.__dict__,
                 "train_mean": train_mean,
                 "train_std": train_std,
-                "last_epoch": epoch,
                 "optimizer": trainer.opt.state_dict(),
                 "scaler": trainer.scaler.state_dict(),
+                "last_epoch": epoch,
                 "best_test_recon_mse": best_test,
                 "mlflow_run_id": run_id,
             }
@@ -790,9 +874,9 @@ def run_training(
                     "cfg": cfg.__dict__,
                     "train_mean": train_mean,
                     "train_std": train_std,
-                    "last_epoch": epoch,
                     "optimizer": trainer.opt.state_dict(),
                     "scaler": trainer.scaler.state_dict(),
+                    "last_epoch": epoch,
                     "best_test_recon_mse": best_test,
                     "mlflow_run_id": run_id,
                 }
@@ -824,9 +908,9 @@ def run_training(
             "cfg": cfg.__dict__,
             "train_mean": train_mean,
             "train_std": train_std,
-            "last_epoch": cfg.epochs,
             "optimizer": trainer.opt.state_dict(),
             "scaler": trainer.scaler.state_dict(),
+            "last_epoch": cfg.epochs,
             "best_test_recon_mse": best_test,
             "mlflow_run_id": run_id,
         },
@@ -849,71 +933,50 @@ def run_training(
     return final_ckpt_path, (train_mean, train_std), cfg
 
 
-def _diffusion_config_from_ckpt(cfg_dict: Dict[str, Any]) -> DiffusionConfig:
-    fields = set(DiffusionConfig.__dataclass_fields__.keys())
-    return DiffusionConfig(**{k: v for k, v in cfg_dict.items() if k in fields})
-
-
-def mlflow_last_logged_step(tracking_uri: str, run_id: str, metric_name: str = "train_loss") -> int:
-    """Largest `step` seen for `metric_name` in the given run (0 if none)."""
-    client = MlflowClient(tracking_uri)
-    history = client.get_metric_history(run_id, metric_name)
-    if not history:
-        return 0
-    return max(h.step for h in history)
-
-
 def run_training_resume(
     data,
     ckpt_path: str,
-    out_dir: str,
-    additional_epochs: int,
+    out_dir: str = None,
+    additional_epochs: int = 10,
     mlflow_run_id: Optional[str] = None,
     seed: int = 0,
     epoch_offset: Optional[int] = None,
 ):
     """
-    Resume training from a checkpoint produced by `run_training` (ddpm_sparse_cfg).
-
-    - Reloads model weights and (if present) optimizer + GradScaler state.
-    - Uses `train_mean` / `train_std` from the checkpoint (same normalization as original run).
-    - If `mlflow_run_id` is set, continues that MLflow run and logs metrics with `step` after the
-      last logged `train_loss` step (or `epoch_offset` if you pass it explicitly).
-    - If `mlflow_run_id` is None, starts a new MLflow run named `cfg_conditional_ddpm_resume`.
-
-    Returns:
-        (best_ckpt_path, (train_mean, train_std), cfg)
+    Resume PIDM training from a checkpoint and optionally continue MLflow logging
+    on the same run.
     """
-    os.makedirs(out_dir, exist_ok=True)
     seed_everything(seed)
     device = default_device()
-    print("Device:", device)
-    print(f"Resuming from checkpoint: {os.path.abspath(ckpt_path)}")
 
-    try:
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    except TypeError:
-        ckpt = torch.load(ckpt_path, map_location=device)
-    train_mean = float(ckpt["train_mean"])
-    train_std = float(ckpt["train_std"])
-    cfg = _diffusion_config_from_ckpt(ckpt["cfg"])
+    if out_dir is None:
+        out_dir = str(Path(ckpt_path).resolve().parent)
+    os.makedirs(out_dir, exist_ok=True)
 
+    # Data split (same convention as training)
     if isinstance(data, np.ndarray):
         data_t = torch.from_numpy(data)
     elif torch.is_tensor(data):
         data_t = data
     else:
         raise TypeError("data must be a numpy array or torch tensor")
-
     assert data_t.ndim == 3 and data_t.shape[1:] == (64, 64), f"Expected (N,64,64), got {data_t.shape}"
+
     N = data_t.shape[0]
     n_train = int(0.8 * N)
     train_full = data_t[:n_train]
     test_full = data_t[n_train:]
 
+    ckpt = torch.load(ckpt_path, map_location=device)
+    cfg = _diffusion_config_from_ckpt(ckpt["cfg"])
+    train_mean = float(ckpt["train_mean"])
+    train_std = float(ckpt["train_std"])
+    start_epoch = int(ckpt.get("last_epoch", 0))
+    end_epoch = start_epoch + int(additional_epochs)
+    best_test = float(ckpt.get("best_test_recon_mse", float("inf")))
+
     train_ds = NavierStokesSparseDataset(train_full, mean=train_mean, std=train_std, sensor_stride=8)
     test_ds = NavierStokesSparseDataset(test_full, mean=train_mean, std=train_std, sensor_stride=8)
-
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
@@ -932,116 +995,95 @@ def run_training_resume(
     )
 
     model = ConditionalDDPM(T=cfg.T, emb_dim=256, base_ch=64)
-    model.load_state_dict(ckpt["model"])
     trainer = DDPMTrainer(model, cfg, device, data_mean=train_mean, data_std=train_std)
+    trainer.model.load_state_dict(ckpt["model"])
 
-    if "optimizer" in ckpt and ckpt["optimizer"] is not None:
-        trainer.opt.load_state_dict(ckpt["optimizer"])
-        print("Loaded optimizer state from checkpoint.")
-    else:
-        print("No optimizer state in checkpoint; optimizer reinitialized.")
-
-    if "scaler" in ckpt and ckpt["scaler"] is not None:
+    if "optimizer" in ckpt:
+        try:
+            trainer.opt.load_state_dict(ckpt["optimizer"])
+            print("Loaded optimizer state from checkpoint.")
+        except Exception as e:
+            print(f"WARNING: Failed to load optimizer state, using fresh optimizer: {e}")
+    if "scaler" in ckpt:
         try:
             trainer.scaler.load_state_dict(ckpt["scaler"])
-            print("Loaded GradScaler state from checkpoint.")
+            print("Loaded AMP scaler state from checkpoint.")
         except Exception as e:
-            print(f"Could not load GradScaler state: {e}")
+            print(f"WARNING: Failed to load scaler state, using fresh scaler: {e}")
 
-    # Must match run_training: file:{out_dir}/mlruns (use same absolute path for metric lookup)
-    mlflow_uri = f"file:{os.path.abspath(os.path.join(out_dir, 'mlruns'))}"
-    mlflow.set_tracking_uri(mlflow_uri)
-    mlflow.set_experiment("pidm_2dns")
+    print(f"Resuming from checkpoint: {os.path.abspath(ckpt_path)}")
+    print(f"Epoch range: {start_epoch + 1} .. {end_epoch} (additional={additional_epochs})")
+    print(f"Best test_recon_mse so far: {best_test}")
 
-    if mlflow_run_id:
-        if epoch_offset is not None:
-            start_step = int(epoch_offset)
-        else:
-            start_step = mlflow_last_logged_step(mlflow_uri, mlflow_run_id, "train_loss")
-            if start_step == 0:
-                start_step = int(ckpt.get("last_epoch", 0))
-        print(f"MLflow run {mlflow_run_id}: logging new epochs at step > {start_step} (next step = {start_step + 1})")
+    tracking_uri = f"file:{out_dir}/mlruns"
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_experiment("conditional_ddpm_2dns")
+
+    run_id = mlflow_run_id or ckpt.get("mlflow_run_id")
+    if run_id:
+        step_base = epoch_offset if epoch_offset is not None else _next_mlflow_step(run_id, tracking_uri)
+        print(f"Continuing MLflow run_id={run_id} at metric step {step_base}")
+        run_ctx = mlflow.start_run(run_id=run_id)
     else:
-        start_step = int(ckpt.get("last_epoch", 0))
-        print(f"Starting new MLflow run; metric steps start after {start_step} (next step = {start_step + 1}).")
-
-    ckpt_best_path = os.path.join(out_dir, "best.pt")
-    best_test = float(ckpt.get("best_test_recon_mse", float("inf")))
-
-    run_ctx = (
-        mlflow.start_run(run_id=mlflow_run_id)
-        if mlflow_run_id
-        else mlflow.start_run(run_name="pidm_sparse_conditional_ddpm_resume")
-    )
+        step_base = 0 if epoch_offset is None else epoch_offset
+        print("No MLflow run_id provided/found; creating a new MLflow run.")
+        run_ctx = mlflow.start_run(run_name="cfg_conditional_ddpm_resume")
 
     with run_ctx:
         active_run_id = mlflow.active_run().info.run_id
-        if not mlflow_run_id:
-            mlflow.log_param("resumed_from_ckpt", os.path.abspath(ckpt_path))
-            mlflow.log_param("seed", seed)
-            mlflow.log_param("train_mean", train_mean)
-            mlflow.log_param("train_std", train_std)
-            mlflow.log_param("additional_epochs", additional_epochs)
+        mlflow.log_param("resume_from_ckpt", os.path.abspath(ckpt_path))
+        mlflow.log_metric("resume_start_epoch", start_epoch)
+        mlflow.log_metric("resume_additional_epochs", additional_epochs)
 
-        for i in range(1, additional_epochs + 1):
-            log_step = start_step + i
+        for epoch in range(start_epoch + 1, end_epoch + 1):
             t0 = time.time()
-            train_loss, train_loss_data, train_loss_physics = trainer.train_one_epoch(train_loader, i)
+            train_loss, train_loss_data, train_loss_physics = trainer.train_one_epoch(train_loader, epoch)
 
-            payload = {
+            test_mse = trainer.eval_recon_mse(test_loader, num_batches=2)
+            dt = time.time() - t0
+            ml_step = step_base + (epoch - start_epoch)
+
+            mlflow.log_metric("train_loss", float(train_loss), step=ml_step)
+            mlflow.log_metric("train_loss_data", float(train_loss_data), step=ml_step)
+            mlflow.log_metric("train_loss_physics", float(train_loss_physics), step=ml_step)
+            mlflow.log_metric("test_recon_mse", float(test_mse), step=ml_step)
+
+            if math.isnan(test_mse):
+                print("WARNING: test_mse is NaN; saving anyway.")
+                test_mse = float("inf")
+
+            ckpt_common = {
                 "model": trainer.model.state_dict(),
                 "cfg": cfg.__dict__,
                 "train_mean": train_mean,
                 "train_std": train_std,
-                "last_epoch": log_step,
                 "optimizer": trainer.opt.state_dict(),
-                "scaler": trainer.scaler.state_dict() if hasattr(trainer.scaler, "state_dict") else None,
+                "scaler": trainer.scaler.state_dict(),
+                "last_epoch": epoch,
                 "best_test_recon_mse": best_test,
                 "mlflow_run_id": active_run_id,
             }
-            torch.save(payload, os.path.join(out_dir, "conditional.pt"))
-
-            test_mse = trainer.eval_recon_mse(test_loader, num_batches=2)
-            dt = time.time() - t0
-
-            mlflow.log_metric("train_loss", float(train_loss), step=log_step)
-            mlflow.log_metric("train_loss_data", float(train_loss_data), step=log_step)
-            mlflow.log_metric("train_loss_physics", float(train_loss_physics), step=log_step)
-            mlflow.log_metric("test_recon_mse", float(test_mse), step=log_step)
+            torch.save(ckpt_common, os.path.join(out_dir, "conditional.pt"))
 
             print(
-                f"Epoch (resume {i}/{additional_epochs}) global_step={log_step} | "
-                f"train_loss={train_loss:.6f} (data={train_loss_data:.6f}, phys={train_loss_physics:.6f}) | "
+                f"Epoch {epoch:03d} | train_loss={train_loss:.6f} "
+                f"(data={train_loss_data:.6f}, phys={train_loss_physics:.6f}) | "
                 f"test_recon_mse~={test_mse:.6f} | {dt:.1f}s"
             )
 
-            if math.isnan(test_mse):
-                test_mse = float("inf")
-
-            if test_mse < best_test:
+            if epoch == (start_epoch + 1) or test_mse < best_test:
                 best_test = test_mse
-                payload["best_test_recon_mse"] = best_test
-                torch.save(payload, ckpt_best_path)
+                ckpt_common["best_test_recon_mse"] = best_test
+                best_path = os.path.join(out_dir, "best.pt")
+                torch.save(ckpt_common, best_path)
                 mlflow.log_artifact(os.path.join(out_dir, "conditional.pt"), artifact_path="checkpoints")
-                mlflow.log_artifact(ckpt_best_path, artifact_path="checkpoints")
-                print(f"  ✓ NEW BEST: {os.path.abspath(ckpt_best_path)}")
+                mlflow.log_artifact(best_path, artifact_path="checkpoints")
+                print(f"  ✓ NEW BEST! checkpoint={os.path.abspath(best_path)} | best={best_test:.6f}")
 
-    torch.save(
-        {
-            "model": trainer.model.state_dict(),
-            "cfg": cfg.__dict__,
-            "train_mean": train_mean,
-            "train_std": train_std,
-            "last_epoch": start_step + additional_epochs,
-            "optimizer": trainer.opt.state_dict(),
-            "scaler": trainer.scaler.state_dict() if hasattr(trainer.scaler, "state_dict") else None,
-            "best_test_recon_mse": best_test,
-            "mlflow_run_id": active_run_id,
-        },
-        os.path.join(out_dir, "conditional.pt"),
-    )
-
-    return ckpt_best_path, (train_mean, train_std), cfg
+    final_ckpt_path = os.path.join(out_dir, "best.pt")
+    last_ckpt_path = os.path.join(out_dir, "conditional.pt")
+    print("Done (resume). Best approx test recon MSE:", best_test)
+    return final_ckpt_path, (train_mean, train_std), cfg
 
 
 # -------------------------
@@ -1052,18 +1094,18 @@ def run_training_resume(
 
 
 # -------------------------
-# Loading + sampling example (reconstruct full field from 64x64 y on test)
+# Loading + sampling example (reconstruct full field from sparse y on test)
 # -------------------------
 @torch.no_grad()
 def load_and_sample(
     ckpt_path: str,
-    data,
+    data,  # same shape (N,64,64) to pull test examples from
     num_samples: int = 8,
-    guidance_scale: float = 1.0,
-    sensor_stride: int = 8,
+    guidance_scale: float = 4.0,
 ):
     device = default_device()
 
+    # load checkpoint
     ckpt = torch.load(ckpt_path, map_location=device)
     cfg_dict = ckpt["cfg"]
     T = cfg_dict["T"]
@@ -1072,18 +1114,15 @@ def load_and_sample(
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    cfg = _diffusion_config_from_ckpt(cfg_dict)
-    trainer = DDPMTrainer(
-        model, cfg, device,
-        data_mean=float(ckpt["train_mean"]),
-        data_std=float(ckpt["train_std"]),
-    )
+    # re-create diffusion wrapper
+    cfg = DiffusionConfig(**cfg_dict)
+    trainer = DDPMTrainer(model, cfg, device)
 
+    # prepare test split as requested: last 20%
     if isinstance(data, np.ndarray):
         data_t = torch.from_numpy(data)
     else:
         data_t = data
-
     N = data_t.shape[0]
     n_train = int(0.8 * N)
     test_full = data_t[n_train:].float()
@@ -1091,28 +1130,24 @@ def load_and_sample(
     mean = ckpt["train_mean"]
     std = ckpt["train_std"]
 
-    # pick center indices k with neighbors available in test split
-    max_k = test_full.shape[0] - 2
-    k_idx = torch.randint(1, max_k + 1, (num_samples,))
-    x0 = test_full[k_idx]                        # (B,64,64)
-    x0n = (x0 - mean) / (std + 1e-8)          # normalized
+    # pick some random test examples
+    idx = torch.randint(0, test_full.shape[0], (num_samples,))
+    x0 = test_full[idx]  # (B,64,64)
+    x0n = (x0 - mean) / (std + 1e-8)
 
-    mask = torch.zeros_like(x0n)
-    mask[:, ::sensor_stride, ::sensor_stride] = 1.0   # 8x8 lattice if stride=8
+    # build y (8,8)
+    coords = torch.arange(0, 64, 8)
+    y = x0n[:, coords][:, :, coords]  # (B,8,8)
 
-    y_sparse = x0n * mask
-    cond = torch.stack([y_sparse, mask], dim=1)       # (B,2,64,64)
+    x0n = x0n.unsqueeze(1).to(device)  # (B,1,64,64)
+    y = y.unsqueeze(1).to(device)      # (B,1,8,8)
 
-    xhat = trainer.sample_cfg(cond=cond.to(device),
-                              guidance_scale=guidance_scale,
-                              shape=(num_samples, 1, 64, 64))
+    xhat = trainer.sample_cfg(y=y, guidance_scale=guidance_scale, shape=(num_samples, 1, 64, 64))
+    # unnormalize to original scale
+    xhat = xhat.squeeze(1) * (std + 1e-8) + mean  # (B,64,64)
+    x0 = x0  # original
 
-    xhat = xhat.squeeze(1) * (std + 1e-8) + mean
-
-    # optional: return sparse observation on original scale for plotting
-    y_sparse_denorm = y_sparse * (std + 1e-8) + mean * mask
-
-    return x0.cpu(), xhat.cpu(), y_sparse_denorm.cpu(), mask.cpu()
+    return x0.cpu(), xhat.cpu(), y.squeeze(1).cpu()  # y is normalized 8x8
 
 
 # Example:

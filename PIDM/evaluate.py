@@ -73,9 +73,9 @@ def evaluate_on_test(
             break
 
         batch_start = time.time()
-        _xp, x0_norm, _xn, _yp, y_norm, _yn = batch
+        _xp, x0_norm, _xn, _yp, cond, _yn = batch
         x0_norm = x0_norm.to(device)  # (B,1,64,64), normalized — center time k
-        y_norm = y_norm.to(device)  # (B,1,8,8), sparse obs at k — matches CondEncoder8x8
+        cond = cond.to(device)  # (B,2,64,64): [sparse field, mask]
 
         B = x0_norm.size(0)
         total_samples += B
@@ -87,7 +87,7 @@ def evaluate_on_test(
 
         sample_start = time.time()
         xhat_norm = trainer.sample_cfg(
-            y=y_norm,
+            cond=cond,
             guidance_scale=guidance_scale,
             shape=(B, 1, 64, 64),
         )
@@ -245,7 +245,7 @@ def run_eval(
     print("✓ Model loaded and set to eval mode")
 
     cfg = _diffusion_config_from_ckpt(cfg_dict)
-    trainer = DDPMTrainer(model, cfg, device)
+    trainer = DDPMTrainer(model, cfg, device, data_mean=mean, data_std=std)
     print("✓ Trainer initialized")
 
     print(f"\n{'='*60}")
