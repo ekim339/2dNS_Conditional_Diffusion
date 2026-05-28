@@ -1,8 +1,10 @@
 """
-PIDM evaluation: same procedure as ddpm_sparse_cfg/evaluate.py (CFG sampling,
-train/test subsplits, full-field and sensor MSE/MAE), but uses PIDM training
-code in cfgConditional.py — 8×8 sparse conditioning and checkpoints that may
-include extra cfg keys (e.g. lambda_phys). Physics loss is training-only.
+PIDM evaluation: same procedure as ddpm_sparse_cfg/evaluate.py (conditional DDPM
+sampling, train/test subsplits, full-field and sensor MSE/MAE).
+
+Uses model.py — sparse (field + mask) on 64×64 grid, 6-tensor dataset triplets
+(center frame used for metrics; neighbors only define valid indices). Physics
+loss (lambda_phys, etc.) is training-only.
 """
 import os
 import time
@@ -45,11 +47,6 @@ def evaluate_on_test(
     device = trainer.device
     trainer.model.eval()
 
-    coords = torch.arange(0, 64, sensor_stride, device=device)
-
-    def H(x64):  # x64: (B,64,64)
-        return x64[:, coords][:, :, coords]  # (B, S, S), S = 64 // sensor_stride
-
     mse_list, mae_list, sensor_mse_list = [], [], []
 
     print(f"\n{'='*60}")
@@ -60,19 +57,23 @@ def evaluate_on_test(
     else:
         print(f"Evaluating on all batches")
     print(f"Guidance scale: {guidance_scale}")
-    print(f"Sensor stride: {sensor_stride} (grid {len(coords)}×{len(coords)})")
+    print(f"Sensor stride: {sensor_stride} (grid {64 // sensor_stride}×{64 // sensor_stride})")
     print(f"Device: {device}")
     print(f"{'='*60}\n")
 
     total_samples = 0
     start_time = time.time()
 
-    # Dataset returns 6 tensors for physics training: center frame + y is what we evaluate.
+    # NavierStokesSparseDataset: (x_prev, x0, x_next, cond_prev, cond, cond_next)
     for b, batch in enumerate(test_loader):
         if num_batches is not None and b >= num_batches:
             break
 
         batch_start = time.time()
+        if len(batch) != 6:
+            raise ValueError(
+                f"Expected 6-tensor PIDM batch from NavierStokesSparseDataset, got {len(batch)} tensors"
+            )
         _xp, x0_norm, _xn, _yp, cond, _yn = batch
         x0_norm = x0_norm.to(device)  # (B,1,64,64), normalized — center time k
         cond = cond.to(device)  # (B,2,64,64): [sparse field, mask]
@@ -99,9 +100,10 @@ def evaluate_on_test(
         mse = F.mse_loss(xhat, x0).item()
         mae = F.l1_loss(xhat, x0).item()
 
-        y_true = H(x0)
-        y_pred = H(xhat)
-        sensor_mse = F.mse_loss(y_pred, y_true).item()
+        # Sensor MSE on masked grid locations (cond channel 1), same as ddpm_sparse_cfg
+        mask = cond[:, 1:2]  # (B,1,64,64)
+        diff_sq = (xhat - x0) ** 2 * mask.squeeze(1)
+        sensor_mse = (diff_sq.sum() / mask.sum().clamp(min=1e-8)).item()
 
         mse_list.append(mse)
         mae_list.append(mae)
@@ -153,7 +155,7 @@ def run_eval(
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(
             f"Checkpoint file not found: {ckpt_path}\n"
-            f"Train PIDM (cfgConditional.run_training / resume) to produce a .pt checkpoint."
+            f"Train PIDM (model.run_training / resume) to produce a .pt checkpoint."
         )
 
     if not ckpt_path.endswith(".pt"):
@@ -196,7 +198,6 @@ def run_eval(
 
     train_sampled = train_full[train_indices]
     test_sampled = test_full[test_indices]
-    eval_data = torch.cat([train_sampled, test_sampled], dim=0)
 
     print(f"\nSampling for evaluation:")
     print(f"  Train samples selected: {len(train_indices)} (from {n_train} available)")

@@ -105,23 +105,36 @@ class NavierStokesSparseDataset(Dataset):
         self.sensor_stride = int(sensor_stride)
 
     def __len__(self):
-        return self.x.shape[0]
+        # Need both neighbors (k-1, k+1) for physics-loss diagnostics.
+        return max(0, self.x.shape[0] - 2)
+
+    def _normalize(self, field: torch.Tensor) -> torch.Tensor:
+        return (field - self.mean) / (self.std + 1e-8)
+
+    def _sparse_cond(self, field_norm: torch.Tensor) -> torch.Tensor:
+        mask = torch.zeros_like(field_norm)
+        mask[::self.sensor_stride, ::self.sensor_stride] = 1.0
+        y_sparse = field_norm * mask
+        return torch.stack([y_sparse, mask], dim=0)  # (2,64,64)
 
     def __getitem__(self, idx: int):
-        x0 = self.x[idx]  # (64,64)
-        x0 = (x0 - self.mean) / (self.std + 1e-8)
+        k = idx + 1
+        x_prev = self._normalize(self.x[k - 1])
+        x0 = self._normalize(self.x[k])
+        x_next = self._normalize(self.x[k + 1])
 
-        # 8x8 sparse sensor mask on 64x64 grid
-        mask = torch.zeros_like(x0)
-        mask[::self.sensor_stride, ::self.sensor_stride] = 1.0
+        cond_prev = self._sparse_cond(x_prev)
+        cond = self._sparse_cond(x0)
+        cond_next = self._sparse_cond(x_next)
 
-        # sparse observed field
-        y_sparse = x0 * mask
-
-        # condition has 2 channels: [sparse field, mask]
-        cond = torch.stack([y_sparse, mask], dim=0)   # (2,64,64)
-
-        return x0.unsqueeze(0), cond   # x0: (1,64,64), cond: (2,64,64)
+        return (
+            x_prev.unsqueeze(0),
+            x0.unsqueeze(0),
+            x_next.unsqueeze(0),
+            cond_prev,
+            cond,
+            cond_next,
+        )
 
 # -------------------------
 # Time embedding
@@ -315,13 +328,26 @@ class DiffusionConfig:
     epochs: int = 10
     guidance_scale: float = 1.0  # CFG sampling scale
     use_amp: bool = True
+    dt_phys: float = 1e-3
+    viscosity: float = 1e-3
+    low_freq_k_cutoff: Optional[float] = 2.0
 
 
 class DDPMTrainer:
-    def __init__(self, model: ConditionalDDPM, cfg: DiffusionConfig, device: torch.device):
+    def __init__(
+        self,
+        model: ConditionalDDPM,
+        cfg: DiffusionConfig,
+        device: torch.device,
+        data_mean: float = 0.0,
+        data_std: float = 1.0,
+    ):
         self.model = model.to(device)
         self.cfg = cfg
         self.device = device
+        self.data_mean = float(data_mean)
+        self.data_std = float(data_std)
+        self.dt = cfg.dt_phys
 
         betas = make_beta_schedule(cfg.T, cfg.beta_schedule).to(device)
         alphas = 1.0 - betas
@@ -343,6 +369,57 @@ class DDPMTrainer:
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         return extract(self.sqrt_alphas_cumprod, t, x0.shape) * x0 + \
                extract(self.sqrt_one_minus_alphas_cumprod, t, x0.shape) * noise
+
+    def pde_residual(
+        self,
+        omega_k_minus_1: torch.Tensor,
+        omega_k: torch.Tensor,
+        omega_k_plus_1: torch.Tensor,
+    ) -> torch.Tensor:
+        dt = self.dt
+        nu = self.cfg.viscosity
+
+        w_prev = omega_k_minus_1.squeeze(1)
+        w_cur = omega_k.squeeze(1)
+        w_next = omega_k_plus_1.squeeze(1)
+
+        _, H, W = w_cur.shape
+        device = w_cur.device
+
+        kx = (2 * math.pi) * torch.fft.fftfreq(H, device=device).view(H, 1)
+        ky = (2 * math.pi) * torch.fft.rfftfreq(W, device=device).view(1, W // 2 + 1)
+        k2 = kx**2 + ky**2
+
+        k_cutoff = self.cfg.low_freq_k_cutoff
+        if k_cutoff is not None and k_cutoff > 0:
+            low_mask = (k2 < (float(k_cutoff) ** 2)).to(dtype=torch.float32)
+            w_prev = torch.fft.irfft2(torch.fft.rfft2(w_prev) * low_mask, s=(H, W))
+            w_cur = torch.fft.irfft2(torch.fft.rfft2(w_cur) * low_mask, s=(H, W))
+            w_next = torch.fft.irfft2(torch.fft.rfft2(w_next) * low_mask, s=(H, W))
+
+        w_fft = torch.fft.rfft2(w_cur)
+        k2_safe = k2.clone()
+        k2_safe[0, 0] = 1.0
+        psi_fft = -w_fft / (k2_safe + 1e-6)
+        psi_fft[..., 0, 0] = 0.0
+
+        u = torch.fft.irfft2(1j * ky * psi_fft, s=(H, W))
+        v = torch.fft.irfft2(-1j * kx * psi_fft, s=(H, W))
+        u = torch.clamp(u, -10.0, 10.0)
+        v = torch.clamp(v, -10.0, 10.0)
+
+        w_x = torch.fft.irfft2(1j * kx * w_fft, s=(H, W))
+        w_y = torch.fft.irfft2(1j * ky * w_fft, s=(H, W))
+        w_x = torch.clamp(w_x, -100.0, 100.0)
+        w_y = torch.clamp(w_y, -100.0, 100.0)
+
+        lap_fft = -(kx**2 + ky**2) * w_fft
+        lap_fft = torch.clamp(lap_fft.real, -1e6, 1e6) + 1j * torch.clamp(lap_fft.imag, -1e6, 1e6)
+        lap_w = torch.fft.irfft2(lap_fft, s=(H, W))
+
+        w_t = (w_next - w_prev) / (2.0 * dt)
+        residual = w_t + u * w_x + v * w_y - nu * lap_w
+        return residual.unsqueeze(1)
 
     def p_mean_variance(self, x_t: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -419,14 +496,20 @@ class DDPMTrainer:
     def train_one_epoch(self, loader: DataLoader, epoch: int):
         self.model.train()
         total_loss = 0.0
+        total_diff_loss = 0.0
+        total_phys_loss = 0.0
         n = 0
         num_batches = len(loader)
         
         print(f"  Starting epoch {epoch} ({num_batches} batches)...")
 
-        for batch_idx, (x0, cond) in enumerate(loader):
-            x0 = x0.to(self.device)  # (B,1,64,64)
-            cond = cond.to(self.device)    # (B,1,64,64)
+        for batch_idx, (omega_prev, x0, omega_next, cond_prev, cond, cond_next) in enumerate(loader):
+            omega_prev = omega_prev.to(self.device)
+            x0 = x0.to(self.device)
+            omega_next = omega_next.to(self.device)
+            cond_prev = cond_prev.to(self.device)
+            cond = cond.to(self.device)
+            cond_next = cond_next.to(self.device)
 
             B = x0.size(0)
             t = torch.randint(0, self.cfg.T, (B,), device=self.device, dtype=torch.long)
@@ -445,22 +528,55 @@ class DDPMTrainer:
                 idx_c = torch.nonzero(cond_mask, as_tuple=False).squeeze(1)
                 idx_u = torch.nonzero(~cond_mask, as_tuple=False).squeeze(1)
 
-                loss = 0.0
+                loss_weighted = 0.0
                 denom = 0
 
                 if idx_c.numel() > 0:
                     eps_pred_c = self.model(x_t[idx_c], t[idx_c], cond[idx_c])
                     loss_c = F.mse_loss(eps_pred_c, noise[idx_c])
-                    loss = loss + loss_c * idx_c.numel()
+                    loss_weighted = loss_weighted + loss_c * idx_c.numel()
                     denom += idx_c.numel()
 
                 if idx_u.numel() > 0:
                     eps_pred_u = self.model(x_t[idx_u], t[idx_u], None)
                     loss_u = F.mse_loss(eps_pred_u, noise[idx_u])
-                    loss = loss + loss_u * idx_u.numel()
+                    loss_weighted = loss_weighted + loss_u * idx_u.numel()
                     denom += idx_u.numel()
 
-                loss = loss / max(denom, 1)
+                loss_diff = loss_weighted / max(denom, 1)
+
+                # Physics diagnostics only (not part of optimized objective).
+                if idx_c.numel() > 0:
+                    t_c = t[idx_c]
+                    sqrt_acp = extract(self.sqrt_alphas_cumprod, t, x_t.shape)[idx_c]
+                    sqrt_om = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)[idx_c]
+
+                    eps_pred_center = self.model(x_t[idx_c], t_c, cond[idx_c])
+                    x0_pred = (x_t[idx_c] - sqrt_om * eps_pred_center) / (sqrt_acp + 1e-8)
+                    x0_pred = torch.clamp(x0_pred, -200.0, 200.0)
+
+                    noise_prev = torch.randn_like(omega_prev[idx_c])
+                    noise_next = torch.randn_like(omega_next[idx_c])
+                    x_t_prev = self.q_sample(omega_prev[idx_c], t_c, noise_prev)
+                    x_t_next = self.q_sample(omega_next[idx_c], t_c, noise_next)
+
+                    eps_pred_prev = self.model(x_t_prev, t_c, cond_prev[idx_c])
+                    eps_pred_next = self.model(x_t_next, t_c, cond_next[idx_c])
+                    x_prev_pred = (x_t_prev - sqrt_om * eps_pred_prev) / (sqrt_acp + 1e-8)
+                    x_next_pred = (x_t_next - sqrt_om * eps_pred_next) / (sqrt_acp + 1e-8)
+                    x_prev_pred = torch.clamp(x_prev_pred, -200.0, 200.0)
+                    x_next_pred = torch.clamp(x_next_pred, -200.0, 200.0)
+
+                    scale = self.data_std + 1e-8
+                    x0_phys = x0_pred * scale + self.data_mean
+                    omega_prev_phys = x_prev_pred * scale + self.data_mean
+                    omega_next_phys = x_next_pred * scale + self.data_mean
+
+                    residual = self.pde_residual(omega_prev_phys, x0_phys, omega_next_phys)
+                    loss_phys = F.smooth_l1_loss(residual, torch.zeros_like(residual))
+                else:
+                    loss_phys = torch.tensor(0.0, device=x_t.device)
+                loss = loss_diff
 
             self.scaler.scale(loss).backward()
             if self.cfg.grad_clip is not None:
@@ -470,16 +586,29 @@ class DDPMTrainer:
             self.scaler.update()
 
             total_loss += float(loss.item()) * B
+            total_diff_loss += float(loss_diff.item()) * B
+            total_phys_loss += float(loss_phys.item()) * B
             n += B
             
             # Print progress every 10% of batches or every 10 batches, whichever is more frequent
             if (batch_idx + 1) % max(1, num_batches // 10) == 0 or (batch_idx + 1) % 10 == 0:
                 current_avg_loss = total_loss / max(n, 1)
-                print(f"    Batch {batch_idx + 1}/{num_batches} | Loss: {loss.item():.6f} | Avg Loss: {current_avg_loss:.6f}")
+                current_avg_diff = total_diff_loss / max(n, 1)
+                current_avg_phys = total_phys_loss / max(n, 1)
+                print(
+                    f"    Batch {batch_idx + 1}/{num_batches} | "
+                    f"Loss: {loss.item():.6f} | Diff: {loss_diff.item():.6f} | Phys: {loss_phys.item():.6f} | "
+                    f"Avg Loss: {current_avg_loss:.6f} | Avg Diff: {current_avg_diff:.6f} | Avg Phys: {current_avg_phys:.6f}"
+                )
 
         avg_loss = total_loss / max(n, 1)
-        print(f"  Epoch {epoch} complete | Average Loss: {avg_loss:.6f}")
-        return avg_loss
+        avg_diff_loss = total_diff_loss / max(n, 1)
+        avg_phys_loss = total_phys_loss / max(n, 1)
+        print(
+            f"  Epoch {epoch} complete | Average Loss: {avg_loss:.6f} | "
+            f"Average Diff: {avg_diff_loss:.6f} | Average Phys: {avg_phys_loss:.6f}"
+        )
+        return avg_loss, avg_diff_loss, avg_phys_loss
 
     @torch.no_grad()
     def eval_recon_mse(self, loader: DataLoader, num_batches: int = 2) -> float:
@@ -489,7 +618,7 @@ class DDPMTrainer:
         """
         self.model.eval()
         mses = []
-        for i, (x0, cond) in enumerate(loader):
+        for i, (_, x0, _, _, cond, _) in enumerate(loader):
             if i >= num_batches:
                 break
             x0 = x0.to(self.device)
@@ -577,7 +706,7 @@ def run_training(
     )
 
     model = ConditionalDDPM(T=cfg.T, emb_dim=256, base_ch=64)
-    trainer = DDPMTrainer(model, cfg, device)
+    trainer = DDPMTrainer(model, cfg, device, data_mean=train_mean, data_std=train_std)
 
     ckpt_path = os.path.join(out_dir, "best.pt")
     
@@ -609,7 +738,7 @@ def run_training(
 
         for epoch in range(1, cfg.epochs + 1):
             t0 = time.time()
-            train_loss = trainer.train_one_epoch(train_loader, epoch)
+            train_loss, train_loss_data, train_loss_physics = trainer.train_one_epoch(train_loader, epoch)
             
             ckpt = {
                 "model": trainer.model.state_dict(),
@@ -627,9 +756,15 @@ def run_training(
             dt = time.time() - t0
 
             mlflow.log_metric("train_loss", float(train_loss), step=epoch)
+            mlflow.log_metric("train_loss_data", float(train_loss_data), step=epoch)
+            mlflow.log_metric("train_loss_physics", float(train_loss_physics), step=epoch)
             mlflow.log_metric("test_recon_mse", float(test_mse), step=epoch)
 
-            print(f"Epoch {epoch:03d} | train_loss={train_loss:.6f} | test_recon_mse~={test_mse:.6f} | {dt:.1f}s")
+            print(
+                f"Epoch {epoch:03d} | train_loss={train_loss:.6f} "
+                f"(data={train_loss_data:.6f}, phys={train_loss_physics:.6f}) | "
+                f"test_recon_mse~={test_mse:.6f} | {dt:.1f}s"
+            )
 
             if math.isnan(test_mse):
                 print("WARNING: test_mse is NaN; saving anyway.")
@@ -783,7 +918,7 @@ def run_training_resume(
 
     model = ConditionalDDPM(T=cfg.T, emb_dim=256, base_ch=64)
     model.load_state_dict(ckpt["model"])
-    trainer = DDPMTrainer(model, cfg, device)
+    trainer = DDPMTrainer(model, cfg, device, data_mean=train_mean, data_std=train_std)
 
     if "optimizer" in ckpt and ckpt["optimizer"] is not None:
         trainer.opt.load_state_dict(ckpt["optimizer"])
@@ -835,7 +970,7 @@ def run_training_resume(
         for i in range(1, additional_epochs + 1):
             log_step = start_step + i
             t0 = time.time()
-            train_loss = trainer.train_one_epoch(train_loader, i)
+            train_loss, train_loss_data, train_loss_physics = trainer.train_one_epoch(train_loader, i)
 
             payload = {
                 "model": trainer.model.state_dict(),
@@ -852,11 +987,14 @@ def run_training_resume(
             dt = time.time() - t0
 
             mlflow.log_metric("train_loss", float(train_loss), step=log_step)
+            mlflow.log_metric("train_loss_data", float(train_loss_data), step=log_step)
+            mlflow.log_metric("train_loss_physics", float(train_loss_physics), step=log_step)
             mlflow.log_metric("test_recon_mse", float(test_mse), step=log_step)
 
             print(
                 f"Epoch (resume {i}/{additional_epochs}) global_step={log_step} | "
-                f"train_loss={train_loss:.6f} | test_recon_mse~={test_mse:.6f} | {dt:.1f}s"
+                f"train_loss={train_loss:.6f} (data={train_loss_data:.6f}, phys={train_loss_physics:.6f}) | "
+                f"test_recon_mse~={test_mse:.6f} | {dt:.1f}s"
             )
 
             if math.isnan(test_mse):
@@ -896,7 +1034,6 @@ def run_training_resume(
 # Loading + sampling example (reconstruct full field from 64x64 y on test)
 # -------------------------
 @torch.no_grad()
-@torch.no_grad()
 def load_and_sample(
     ckpt_path: str,
     data,
@@ -914,8 +1051,12 @@ def load_and_sample(
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    cfg = DiffusionConfig(**cfg_dict)
-    trainer = DDPMTrainer(model, cfg, device)
+    cfg = _diffusion_config_from_ckpt(cfg_dict)
+    trainer = DDPMTrainer(
+        model, cfg, device,
+        data_mean=float(ckpt["train_mean"]),
+        data_std=float(ckpt["train_std"]),
+    )
 
     if isinstance(data, np.ndarray):
         data_t = torch.from_numpy(data)
