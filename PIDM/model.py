@@ -327,7 +327,10 @@ class DiffusionConfig:
     epochs: int = 30
     guidance_scale: float = 1.0  # CFG sampling scale
     use_amp: bool = True
-    lambda_phys: float = 5e-9
+    #lambda_phys: float = 5e-9
+    lambda_phys_start: float = 5e-11
+    lambda_phys_max: float = 5e-9
+    lambda_phys_warmup_ratio: float = 0.5
     dt_phys: float = 1e-3
     viscosity: float = 1e-3
     # Low-pass cutoff in angular wavenumber |k| for physics loss (None = full spectrum).
@@ -518,6 +521,17 @@ class DDPMTrainer:
         dtt = w_next - 2.0 * w_cur + w_prev
         return (dtt ** 2).mean()
 
+
+    @staticmethod
+    def get_lambda_phys(epoch, total_epochs, lambda_start, lambda_max, warmup_ratio=0.5):
+        warmup_epochs = max(1, int(total_epochs * warmup_ratio))
+        progress = min(epoch / warmup_epochs, 1.0)
+
+        # quadratic ramp
+        ramp = progress ** 2
+
+        return lambda_start + ramp * (lambda_max - lambda_start)
+
     def train_one_epoch(self, loader: DataLoader, epoch: int):
         self.model.train()
         total_loss = 0.0
@@ -611,6 +625,17 @@ class DDPMTrainer:
                     loss_smooth_time = torch.tensor(0.0, device=x_t.device)
                     residual = None
 
+                lambda_phys_epoch = self.get_lambda_phys(
+                    epoch=epoch,
+                    total_epochs=self.cfg.epochs,
+                    lambda_start=self.cfg.lambda_phys_start,
+                    lambda_max=self.cfg.lambda_phys_max,
+                    warmup_ratio=self.cfg.lambda_phys_warmup_ratio,
+                )
+
+                weighted_phys_raw = lambda_phys_epoch * loss_phys
+                weighted_phys = torch.clamp(weighted_phys_raw, max=5.0)
+
                 if loss_phys.item() > 1e8:
                     with torch.no_grad():
                         print("\n" + "=" * 80)
@@ -632,7 +657,7 @@ class DDPMTrainer:
                         for name, w in [
                             ("omega_prev_phys", omega_prev_phys),
                             ("x0_phys", x0_phys),
-                            ("omega_next_phys", omega_next_phys),
+                             ("omega_next_phys", omega_next_phys),
                         ]:
                             print(
                                 f"  {name}: "
@@ -656,9 +681,6 @@ class DDPMTrainer:
                         print(f"  |dtt| max:        {dtt.abs().max().item():.6e}")
 
                         print("=" * 80 + "\n")
-
-                weighted_phys = self.cfg.lambda_phys * loss_phys
-                weighted_phys = torch.clamp(weighted_phys, max=5.0)
 
                 loss = (
                             loss_diff
@@ -692,7 +714,8 @@ class DDPMTrainer:
                         f"    Batch {batch_idx + 1}/{num_batches} | "
                         f"Loss: {loss.item():.6f} | "
                         f"Diff: {loss_diff.item():.6f} | "
-                        f"Phys: {loss_phys.item():.6f} | "
+                        f"WeightedPhys: {weighted_phys.item():.6f} | "
+                        f"LambdaPhys: {lambda_phys_epoch:.2e} | "
                         f"Space: {loss_smooth_space.item():.6f} | "
                         f"TimeAccel: {loss_smooth_time.item():.6f} | "
                         #f"Avg Loss: {current_avg_loss:.6f} | "
