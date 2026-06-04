@@ -1322,6 +1322,7 @@ class GroundTruthPhysicsEvaluator:
 def run_ground_truth_physics_baseline(
     data,
     split: str = "train",
+    num_samples: int = 100,
     batch_size: int = 64,
     max_batches: Optional[int] = None,
     dt_phys: float = 1e-3,
@@ -1337,6 +1338,7 @@ def run_ground_truth_physics_baseline(
       - temporal second-difference (acceleration) loss
 
     split: "train" (first 80%), "test" (last 20%), or "all".
+    num_samples: number of random triplet indices to evaluate (default 100).
     """
     seed_everything(seed)
     device = default_device()
@@ -1361,10 +1363,20 @@ def run_ground_truth_physics_baseline(
     else:
         raise ValueError(f"split must be train, test, or all; got {split!r}")
 
-    # Valid center indices: k in [1, len-2] => N-2 triplets per split
+    # Valid triplet indices: idx in [0, len-3] maps to frames (idx, idx+1, idx+2)
     n_triplets = max(0, fields.shape[0] - 2)
     if n_triplets == 0:
         raise ValueError(f"Not enough frames in {split} split for consecutive triplets.")
+
+    n_eval = min(int(num_samples), n_triplets)
+    if n_eval < int(num_samples):
+        print(
+            f"Warning: requested {num_samples} samples but only {n_triplets} triplets "
+            f"available in {split} split; using all {n_eval}."
+        )
+
+    rng = np.random.default_rng(seed)
+    triplet_indices = np.sort(rng.choice(n_triplets, size=n_eval, replace=False))
 
     cfg = DiffusionConfig(
         dt_phys=dt_phys,
@@ -1384,52 +1396,62 @@ def run_ground_truth_physics_baseline(
     print("Ground-truth loss baseline (2DNS + smoothness)")
     print(f"{'='*60}")
     print(f"Device: {device}")
-    print(f"Split: {split} | frames: {fields.shape[0]} | triplets: {n_triplets}")
+    print(f"Split: {split} | frames: {fields.shape[0]} | triplets available: {n_triplets}")
+    print(f"Evaluating: {n_eval} random triplet samples (seed={seed})")
     print(f"dt_phys={dt_phys}, viscosity={viscosity}, low_freq_k_cutoff={low_freq_k_cutoff}")
     print(f"batch_size={batch_size}")
     print(f"{'='*60}\n")
 
+    # Per-sample losses (one scalar per triplet)
+    per_sample_phys = []
+    per_sample_smooth_space = []
+    per_sample_smooth_time = []
+
     batch_idx = 0
-    for start in range(0, n_triplets, batch_size):
+    num_batches_total = (n_eval + batch_size - 1) // batch_size
+    for batch_start in range(0, n_eval, batch_size):
         if max_batches is not None and batch_idx >= max_batches:
             break
 
-        end = min(start + batch_size, n_triplets)
-        B = end - start
-        # dataset index idx maps to center k = idx + 1
-        omega_prev = fields[start : start + B].unsqueeze(1).to(device)
-        omega_cur = fields[start + 1 : start + B + 1].unsqueeze(1).to(device)
-        omega_next = fields[start + 2 : start + B + 2].unsqueeze(1).to(device)
+        batch_idx += 1
+        idx_chunk = triplet_indices[batch_start : batch_start + batch_size]
+        B = len(idx_chunk)
+        idx_t = torch.as_tensor(idx_chunk, dtype=torch.long)
+
+        omega_prev = fields[idx_t].unsqueeze(1).to(device)
+        omega_cur = fields[idx_t + 1].unsqueeze(1).to(device)
+        omega_next = fields[idx_t + 2].unsqueeze(1).to(device)
+
+        # Per-sample metrics (B=1 each) for transparent 100-sample reporting
+        for b in range(B):
+            out_b = evaluator.evaluate_triplet_losses(
+                omega_prev[b : b + 1],
+                omega_cur[b : b + 1],
+                omega_next[b : b + 1],
+            )
+            per_sample_phys.append(float(out_b["loss_phys"].item()))
+            per_sample_smooth_space.append(float(out_b["loss_smooth_space"].item()))
+            per_sample_smooth_time.append(float(out_b["loss_smooth_time"].item()))
 
         out = evaluator.evaluate_triplet_losses(omega_prev, omega_cur, omega_next)
-        loss_phys = out["loss_phys"]
-        loss_smooth_space = out["loss_smooth_space"]
-        loss_smooth_time = out["loss_smooth_time"]
         residual = out["residual"]
-
-        phys_list.append(float(loss_phys.item()))
-        smooth_space_list.append(float(loss_smooth_space.item()))
-        smooth_time_list.append(float(loss_smooth_time.item()))
+        phys_list.append(float(out["loss_phys"].item()))
+        smooth_space_list.append(float(out["loss_smooth_space"].item()))
+        smooth_time_list.append(float(out["loss_smooth_time"].item()))
         abs_mean_list.append(float(residual.abs().mean().item()))
         abs_max_list.append(float(residual.abs().max().item()))
         n_samples += B
-        batch_idx += 1
 
-        if batch_idx % max(1, (n_triplets // batch_size) // 10) == 0 or batch_idx == 1:
-            print(
-                f"  Batch {batch_idx} | triplets {start}-{end - 1} | "
-                f"loss_2dns={loss_phys.item():.6e} | "
-                f"loss_smooth_space={loss_smooth_space.item():.6e} | "
-                f"loss_smooth_time={loss_smooth_time.item():.6e} | "
-                f"|R|_mean={abs_mean_list[-1]:.6e} | |R|_max={abs_max_list[-1]:.6e}"
-            )
+        print(
+            f"  Batch {batch_idx}/{num_batches_total} | samples {batch_start + 1}-{batch_start + B}/{n_eval} | "
+            f"batch loss_2dns={out['loss_phys'].item():.6e} | "
+            f"batch smooth_space={out['loss_smooth_space'].item():.6e} | "
+            f"batch smooth_time={out['loss_smooth_time'].item():.6e}"
+        )
 
-    weights = []
-    for bi, start in enumerate(range(0, n_triplets, batch_size)):
-        if max_batches is not None and bi >= max_batches:
-            break
-        end = min(start + batch_size, n_triplets)
-        weights.append(end - start)
+    weights = [len(triplet_indices[i : i + batch_size]) for i in range(0, n_eval, batch_size)]
+    if max_batches is not None:
+        weights = weights[:max_batches]
 
     w_sum = sum(weights)
     avg_phys = sum(l * w for l, w in zip(phys_list, weights)) / w_sum
@@ -1438,26 +1460,42 @@ def run_ground_truth_physics_baseline(
     avg_abs_mean = sum(m * w for m, w in zip(abs_mean_list, weights)) / w_sum
     avg_abs_max = sum(x * w for x, w in zip(abs_max_list, weights)) / w_sum
 
+    # Mean over individual triplet samples (primary 100-sample statistic)
+    mean_phys = float(np.mean(per_sample_phys))
+    mean_smooth_space = float(np.mean(per_sample_smooth_space))
+    mean_smooth_time = float(np.mean(per_sample_smooth_time))
+    std_phys = float(np.std(per_sample_phys))
+    std_smooth_space = float(np.std(per_sample_smooth_space))
+    std_smooth_time = float(np.std(per_sample_smooth_time))
+
     print(f"\n{'='*60}")
     print("Summary (ground truth)")
     print(f"{'='*60}")
-    print(f"  Triplets evaluated: {n_samples}")
-    print(f"  2DNS physics MSE:              {avg_phys:.6e}")
-    print(f"  Spatial smoothness loss:       {avg_smooth_space:.6e}")
-    print(f"  Temporal acceleration loss:    {avg_smooth_time:.6e}")
-    print(f"  |residual| mean:               {avg_abs_mean:.6e}")
-    print(f"  |residual| max (batch avg):     {avg_abs_max:.6e}")
+    print(f"  Triplet samples evaluated: {len(per_sample_phys)}")
+    print(f"  2DNS physics MSE (per-sample mean):     {mean_phys:.6e}  (std {std_phys:.6e})")
+    print(f"  Spatial smoothness (per-sample mean):  {mean_smooth_space:.6e}  (std {std_smooth_space:.6e})")
+    print(f"  Temporal acceleration (per-sample mean): {mean_smooth_time:.6e}  (std {std_smooth_time:.6e})")
+    print(f"  2DNS physics MSE (batch-aggregated):   {avg_phys:.6e}")
+    print(f"  |residual| mean (batch-aggregated):     {avg_abs_mean:.6e}")
+    print(f"  |residual| max (batch avg):             {avg_abs_max:.6e}")
     print(f"{'='*60}\n")
 
     return {
         "split": split,
-        "n_triplets": float(n_samples),
-        "loss_2dns_mse": avg_phys,
-        "loss_smooth_space": avg_smooth_space,
-        "loss_smooth_time": avg_smooth_time,
-        "physics_mse": avg_phys,
+        "n_triplets": float(len(per_sample_phys)),
+        "loss_2dns_mse": mean_phys,
+        "loss_smooth_space": mean_smooth_space,
+        "loss_smooth_time": mean_smooth_time,
+        "loss_2dns_mse_batch_agg": avg_phys,
+        "loss_2dns_mse_std": std_phys,
+        "loss_smooth_space_std": std_smooth_space,
+        "loss_smooth_time_std": std_smooth_time,
+        "physics_mse": mean_phys,
         "residual_abs_mean": avg_abs_mean,
         "residual_abs_max_batch_avg": avg_abs_max,
+        "per_sample_loss_2dns": per_sample_phys,
+        "per_sample_loss_smooth_space": per_sample_smooth_space,
+        "per_sample_loss_smooth_time": per_sample_smooth_time,
         "dt_phys": dt_phys,
         "viscosity": viscosity,
         "low_freq_k_cutoff": low_freq_k_cutoff if low_freq_k_cutoff is not None else -1.0,
@@ -1483,6 +1521,12 @@ if __name__ == "__main__":
         default="train",
         choices=["train", "test", "all"],
         help="Which portion of the dataset to evaluate.",
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=100,
+        help="Number of random (k-1,k,k+1) triplets to evaluate (default: 100).",
     )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument(
@@ -1511,6 +1555,7 @@ if __name__ == "__main__":
     run_ground_truth_physics_baseline(
         data=data,
         split=args.split,
+        num_samples=args.num_samples,
         batch_size=args.batch_size,
         max_batches=args.max_batches,
         dt_phys=args.dt_phys,
