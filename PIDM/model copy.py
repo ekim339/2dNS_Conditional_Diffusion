@@ -1216,8 +1216,10 @@ def load_and_sample(
 # -------------------------
 class GroundTruthPhysicsEvaluator:
     """
-    Same NS vorticity residual as DDPMTrainer.pde_residual, applied to true
-    consecutive fields (k-1, k, k+1) in physical units — no model predictions.
+    Ground-truth diagnostics on true (k-1, k, k+1) fields in physical units.
+
+    Reuses DDPMTrainer.pde_residual / smoothness methods directly — same code
+    path as model.py (including low_freq_k_cutoff filtering in pde_residual).
     """
 
     def __init__(self, cfg: DiffusionConfig, device: torch.device):
@@ -1225,98 +1227,50 @@ class GroundTruthPhysicsEvaluator:
         self.device = device
         self.dt = cfg.dt_phys
 
-    def pde_residual(
-        self,
-        omega_k_minus_1: torch.Tensor,
-        omega_k: torch.Tensor,
-        omega_k_plus_1: torch.Tensor,
-    ) -> torch.Tensor:
-        dt = self.dt
-        nu = self.cfg.viscosity
-
-        w_prev = omega_k_minus_1.squeeze(1)
-        w_cur = omega_k.squeeze(1)
-        w_next = omega_k_plus_1.squeeze(1)
-
-        B, H, W = w_cur.shape
-        device = w_cur.device
-
-        kx = (2 * math.pi) * torch.fft.fftfreq(H, device=device).view(H, 1)
-        ky = (2 * math.pi) * torch.fft.rfftfreq(W, device=device).view(1, W // 2 + 1)
-
-        k2 = kx**2 + ky**2
-        k_cutoff = self.cfg.low_freq_k_cutoff
-        if k_cutoff is not None and k_cutoff > 0:
-            low_mask = (k2 < (float(k_cutoff) ** 2)).to(dtype=torch.float32)
-            w_prev = torch.fft.irfft2(torch.fft.rfft2(w_prev) * low_mask, s=(H, W))
-            w_cur = torch.fft.irfft2(torch.fft.rfft2(w_cur) * low_mask, s=(H, W))
-            w_next = torch.fft.irfft2(torch.fft.rfft2(w_next) * low_mask, s=(H, W))
-
-        w_fft = torch.fft.rfft2(w_cur)
-        k2_safe = k2.clone()
-        k2_safe[0, 0] = 1.0
-
-        eps = 1e-6
-        psi_fft = -w_fft / (k2_safe + eps)
-        psi_fft[..., 0, 0] = 0.0
-
-        u = torch.fft.irfft2(1j * ky * psi_fft, s=(H, W))
-        v = torch.fft.irfft2(-1j * kx * psi_fft, s=(H, W))
-
-        w_x = torch.fft.irfft2(1j * kx * w_fft, s=(H, W))
-        w_y = torch.fft.irfft2(1j * ky * w_fft, s=(H, W))
-
-        lap_fft = -(kx**2 + ky**2) * w_fft
-        lap_w = torch.fft.irfft2(lap_fft, s=(H, W))
-
-        w_t = (w_next - w_prev) / (2.0 * dt)
-        R = w_t + u * w_x + v * w_y - nu * lap_w
-        return R.unsqueeze(1)
-
-    def spatial_smoothness_loss(self, w: torch.Tensor) -> torch.Tensor:
-        """
-        w: (B, 1, H, W)
-        Penalizes nonsmooth behavior in x and y directions (same as DDPMTrainer).
-        """
-        dx = w[:, :, :, 1:] - w[:, :, :, :-1]
-        dy = w[:, :, 1:, :] - w[:, :, :-1, :]
-        return (dx ** 2).mean() + (dy ** 2).mean()
-
-    def temporal_second_difference_loss(
-        self,
-        w_prev: torch.Tensor,
-        w_cur: torch.Tensor,
-        w_next: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Penalizes nonsmooth acceleration in time: w_{k+1} - 2w_k + w_{k-1}.
-        """
-        dtt = w_next - 2.0 * w_cur + w_prev
-        return (dtt ** 2).mean()
+    # Identical implementations to model.py DDPMTrainer (no duplicated logic).
+    pde_residual = DDPMTrainer.pde_residual
+    spatial_smoothness_loss = DDPMTrainer.spatial_smoothness_loss
+    temporal_second_difference_loss = DDPMTrainer.temporal_second_difference_loss
 
     @torch.no_grad()
     def evaluate_triplet_losses(
         self,
-        omega_prev: torch.Tensor,
-        omega_cur: torch.Tensor,
-        omega_next: torch.Tensor,
+        omega_prev_phys: torch.Tensor,
+        omega_cur_phys: torch.Tensor,
+        omega_next_phys: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
-        omega_*: (B, 1, H, W) in physical units.
-        Same diagnostics as model.py train_one_epoch (no diffusion / no model).
+        omega_*_phys: (B, 1, H, W) denormalized physical units (same as model.py x0_phys).
         """
-        residual = self.pde_residual(omega_prev, omega_cur, omega_next)
-        loss_phys = F.mse_loss(residual, torch.zeros_like(residual))
-        loss_smooth_space = self.spatial_smoothness_loss(omega_cur)
+        residual_gt = self.pde_residual(omega_prev_phys, omega_cur_phys, omega_next_phys)
+        loss_phys = F.mse_loss(residual_gt, torch.zeros_like(residual_gt))
+        loss_smooth_space = self.spatial_smoothness_loss(omega_cur_phys)
         loss_smooth_time = self.temporal_second_difference_loss(
-            omega_prev, omega_cur, omega_next
+            omega_prev_phys, omega_cur_phys, omega_next_phys
         )
         return {
             "loss_phys": loss_phys,
             "loss_smooth_space": loss_smooth_space,
             "loss_smooth_time": loss_smooth_time,
-            "residual": residual,
+            "residual": residual_gt,
         }
+
+
+def _raw_frames_to_physical(
+    frames: torch.Tensor,
+    data_mean: float,
+    data_std: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Match model.py training path: normalize then denormalize to physical scale.
+    frames: (B, H, W) raw vorticity from dataset (physical units in .npy).
+    Returns: (B, 1, H, W) on device.
+    """
+    scale = float(data_std) + 1e-8
+    frames_norm = (frames.float() - float(data_mean)) / scale
+    frames_phys = frames_norm * scale + float(data_mean)
+    return frames_phys.unsqueeze(1).to(device)
 
 
 def run_ground_truth_physics_baseline(
@@ -1325,6 +1279,8 @@ def run_ground_truth_physics_baseline(
     num_samples: int = 100,
     batch_size: int = 64,
     max_batches: Optional[int] = None,
+    train_mean: Optional[float] = None,
+    train_std: Optional[float] = None,
     dt_phys: float = 1e-3,
     viscosity: float = 1e-3,
     low_freq_k_cutoff: Optional[float] = 2.0,
@@ -1354,6 +1310,12 @@ def run_ground_truth_physics_baseline(
 
     N = data_t.shape[0]
     n_train = int(0.8 * N)
+    train_full = data_t[:n_train]
+    if train_mean is None:
+        train_mean = train_full.float().mean().item()
+    if train_std is None:
+        train_std = train_full.float().std().item()
+
     if split == "train":
         fields = data_t[:n_train]
     elif split == "test":
@@ -1383,7 +1345,7 @@ def run_ground_truth_physics_baseline(
         viscosity=viscosity,
         low_freq_k_cutoff=low_freq_k_cutoff,
     )
-    evaluator = GroundTruthPhysicsEvaluator(cfg, device)
+    trainer = GroundTruthPhysicsEvaluator(cfg, device)
 
     phys_list = []
     smooth_space_list = []
@@ -1398,6 +1360,7 @@ def run_ground_truth_physics_baseline(
     print(f"Device: {device}")
     print(f"Split: {split} | frames: {fields.shape[0]} | triplets available: {n_triplets}")
     print(f"Evaluating: {n_eval} random triplet samples (seed={seed})")
+    print(f"train_mean={train_mean:.6f}, train_std={train_std:.6f} (denorm: x_phys = x_norm * std + mean)")
     print(f"dt_phys={dt_phys}, viscosity={viscosity}, low_freq_k_cutoff={low_freq_k_cutoff}")
     print(f"batch_size={batch_size}")
     print(f"{'='*60}\n")
@@ -1418,28 +1381,28 @@ def run_ground_truth_physics_baseline(
         B = len(idx_chunk)
         idx_t = torch.as_tensor(idx_chunk, dtype=torch.long)
 
-        omega_prev = fields[idx_t].unsqueeze(1).to(device)
-        omega_cur = fields[idx_t + 1].unsqueeze(1).to(device)
-        omega_next = fields[idx_t + 2].unsqueeze(1).to(device)
+        omega_prev_phys = _raw_frames_to_physical(fields[idx_t], train_mean, train_std, device)
+        omega_cur_phys = _raw_frames_to_physical(fields[idx_t + 1], train_mean, train_std, device)
+        omega_next_phys = _raw_frames_to_physical(fields[idx_t + 2], train_mean, train_std, device)
 
         # Per-sample metrics (B=1 each) for transparent 100-sample reporting
         for b in range(B):
-            out_b = evaluator.evaluate_triplet_losses(
-                omega_prev[b : b + 1],
-                omega_cur[b : b + 1],
-                omega_next[b : b + 1],
+            out_b = trainer.evaluate_triplet_losses(
+                omega_prev_phys[b : b + 1],
+                omega_cur_phys[b : b + 1],
+                omega_next_phys[b : b + 1],
             )
             per_sample_phys.append(float(out_b["loss_phys"].item()))
             per_sample_smooth_space.append(float(out_b["loss_smooth_space"].item()))
             per_sample_smooth_time.append(float(out_b["loss_smooth_time"].item()))
 
-        out = evaluator.evaluate_triplet_losses(omega_prev, omega_cur, omega_next)
-        residual = out["residual"]
+        out = trainer.evaluate_triplet_losses(omega_prev_phys, omega_cur_phys, omega_next_phys)
+        residual_gt = out["residual"]
         phys_list.append(float(out["loss_phys"].item()))
         smooth_space_list.append(float(out["loss_smooth_space"].item()))
         smooth_time_list.append(float(out["loss_smooth_time"].item()))
-        abs_mean_list.append(float(residual.abs().mean().item()))
-        abs_max_list.append(float(residual.abs().max().item()))
+        abs_mean_list.append(float(residual_gt.abs().mean().item()))
+        abs_max_list.append(float(residual_gt.abs().max().item()))
         n_samples += B
 
         print(
@@ -1499,6 +1462,8 @@ def run_ground_truth_physics_baseline(
         "dt_phys": dt_phys,
         "viscosity": viscosity,
         "low_freq_k_cutoff": low_freq_k_cutoff if low_freq_k_cutoff is not None else -1.0,
+        "train_mean": train_mean,
+        "train_std": train_std,
     }
 
 
@@ -1544,6 +1509,12 @@ if __name__ == "__main__":
         help="Low-pass |k| cutoff for residual (same as DiffusionConfig).",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--ckpt",
+        type=str,
+        default=None,
+        help="Optional checkpoint .pt; use train_mean/train_std from it (same as training).",
+    )
     args = parser.parse_args()
 
     if not os.path.isfile(args.data):
@@ -1552,12 +1523,25 @@ if __name__ == "__main__":
     data = np.load(args.data)
     print(f"Loaded {data.shape} from {args.data}")
 
+    ckpt_mean, ckpt_std = None, None
+    if args.ckpt:
+        device = default_device()
+        try:
+            ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
+        except TypeError:
+            ckpt = torch.load(args.ckpt, map_location=device)
+        ckpt_mean = float(ckpt["train_mean"])
+        ckpt_std = float(ckpt["train_std"])
+        print(f"Using normalization from checkpoint: mean={ckpt_mean:.6f}, std={ckpt_std:.6f}")
+
     run_ground_truth_physics_baseline(
         data=data,
         split=args.split,
         num_samples=args.num_samples,
         batch_size=args.batch_size,
         max_batches=args.max_batches,
+        train_mean=ckpt_mean,
+        train_std=ckpt_std,
         dt_phys=args.dt_phys,
         viscosity=args.viscosity,
         low_freq_k_cutoff=args.low_freq_k_cutoff,
