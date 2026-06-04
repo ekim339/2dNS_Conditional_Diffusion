@@ -1273,20 +1273,50 @@ class GroundTruthPhysicsEvaluator:
         R = w_t + u * w_x + v * w_y - nu * lap_w
         return R.unsqueeze(1)
 
+    def spatial_smoothness_loss(self, w: torch.Tensor) -> torch.Tensor:
+        """
+        w: (B, 1, H, W)
+        Penalizes nonsmooth behavior in x and y directions (same as DDPMTrainer).
+        """
+        dx = w[:, :, :, 1:] - w[:, :, :, :-1]
+        dy = w[:, :, 1:, :] - w[:, :, :-1, :]
+        return (dx ** 2).mean() + (dy ** 2).mean()
+
+    def temporal_second_difference_loss(
+        self,
+        w_prev: torch.Tensor,
+        w_cur: torch.Tensor,
+        w_next: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Penalizes nonsmooth acceleration in time: w_{k+1} - 2w_k + w_{k-1}.
+        """
+        dtt = w_next - 2.0 * w_cur + w_prev
+        return (dtt ** 2).mean()
+
     @torch.no_grad()
-    def physics_loss_mse(
+    def evaluate_triplet_losses(
         self,
         omega_prev: torch.Tensor,
         omega_cur: torch.Tensor,
         omega_next: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Dict[str, torch.Tensor]:
         """
-        omega_*: (B, 1, H, W) in physical (denormalized) units.
-        Returns (loss_phys, residual).
+        omega_*: (B, 1, H, W) in physical units.
+        Same diagnostics as model.py train_one_epoch (no diffusion / no model).
         """
         residual = self.pde_residual(omega_prev, omega_cur, omega_next)
         loss_phys = F.mse_loss(residual, torch.zeros_like(residual))
-        return loss_phys, residual
+        loss_smooth_space = self.spatial_smoothness_loss(omega_cur)
+        loss_smooth_time = self.temporal_second_difference_loss(
+            omega_prev, omega_cur, omega_next
+        )
+        return {
+            "loss_phys": loss_phys,
+            "loss_smooth_space": loss_smooth_space,
+            "loss_smooth_time": loss_smooth_time,
+            "residual": residual,
+        }
 
 
 def run_ground_truth_physics_baseline(
@@ -1300,7 +1330,11 @@ def run_ground_truth_physics_baseline(
     seed: int = 0,
 ) -> Dict[str, float]:
     """
-    Evaluate physics MSE on ground-truth consecutive triplets (k-1, k, k+1).
+    Evaluate ground-truth consecutive triplets (k-1, k, k+1) with the same
+    diagnostics as model.py training:
+      - 2DNS physics MSE on PDE residual
+      - spatial smoothness loss (center frame)
+      - temporal second-difference (acceleration) loss
 
     split: "train" (first 80%), "test" (last 20%), or "all".
     """
@@ -1339,13 +1373,15 @@ def run_ground_truth_physics_baseline(
     )
     evaluator = GroundTruthPhysicsEvaluator(cfg, device)
 
-    loss_list = []
+    phys_list = []
+    smooth_space_list = []
+    smooth_time_list = []
     abs_mean_list = []
     abs_max_list = []
     n_samples = 0
 
     print(f"\n{'='*60}")
-    print("Ground-truth physics loss baseline")
+    print("Ground-truth loss baseline (2DNS + smoothness)")
     print(f"{'='*60}")
     print(f"Device: {device}")
     print(f"Split: {split} | frames: {fields.shape[0]} | triplets: {n_triplets}")
@@ -1365,8 +1401,15 @@ def run_ground_truth_physics_baseline(
         omega_cur = fields[start + 1 : start + B + 1].unsqueeze(1).to(device)
         omega_next = fields[start + 2 : start + B + 2].unsqueeze(1).to(device)
 
-        loss_phys, residual = evaluator.physics_loss_mse(omega_prev, omega_cur, omega_next)
-        loss_list.append(float(loss_phys.item()))
+        out = evaluator.evaluate_triplet_losses(omega_prev, omega_cur, omega_next)
+        loss_phys = out["loss_phys"]
+        loss_smooth_space = out["loss_smooth_space"]
+        loss_smooth_time = out["loss_smooth_time"]
+        residual = out["residual"]
+
+        phys_list.append(float(loss_phys.item()))
+        smooth_space_list.append(float(loss_smooth_space.item()))
+        smooth_time_list.append(float(loss_smooth_time.item()))
         abs_mean_list.append(float(residual.abs().mean().item()))
         abs_max_list.append(float(residual.abs().max().item()))
         n_samples += B
@@ -1375,7 +1418,10 @@ def run_ground_truth_physics_baseline(
         if batch_idx % max(1, (n_triplets // batch_size) // 10) == 0 or batch_idx == 1:
             print(
                 f"  Batch {batch_idx} | triplets {start}-{end - 1} | "
-                f"loss_phys={loss_phys.item():.6e} | |R|_mean={abs_mean_list[-1]:.6e} | |R|_max={abs_max_list[-1]:.6e}"
+                f"loss_2dns={loss_phys.item():.6e} | "
+                f"loss_smooth_space={loss_smooth_space.item():.6e} | "
+                f"loss_smooth_time={loss_smooth_time.item():.6e} | "
+                f"|R|_mean={abs_mean_list[-1]:.6e} | |R|_max={abs_max_list[-1]:.6e}"
             )
 
     weights = []
@@ -1386,7 +1432,9 @@ def run_ground_truth_physics_baseline(
         weights.append(end - start)
 
     w_sum = sum(weights)
-    avg_loss = sum(l * w for l, w in zip(loss_list, weights)) / w_sum
+    avg_phys = sum(l * w for l, w in zip(phys_list, weights)) / w_sum
+    avg_smooth_space = sum(l * w for l, w in zip(smooth_space_list, weights)) / w_sum
+    avg_smooth_time = sum(l * w for l, w in zip(smooth_time_list, weights)) / w_sum
     avg_abs_mean = sum(m * w for m, w in zip(abs_mean_list, weights)) / w_sum
     avg_abs_max = sum(x * w for x, w in zip(abs_max_list, weights)) / w_sum
 
@@ -1394,7 +1442,9 @@ def run_ground_truth_physics_baseline(
     print("Summary (ground truth)")
     print(f"{'='*60}")
     print(f"  Triplets evaluated: {n_samples}")
-    print(f"  Physics MSE (mean over batches): {avg_loss:.6e}")
+    print(f"  2DNS physics MSE:              {avg_phys:.6e}")
+    print(f"  Spatial smoothness loss:       {avg_smooth_space:.6e}")
+    print(f"  Temporal acceleration loss:    {avg_smooth_time:.6e}")
     print(f"  |residual| mean:               {avg_abs_mean:.6e}")
     print(f"  |residual| max (batch avg):     {avg_abs_max:.6e}")
     print(f"{'='*60}\n")
@@ -1402,7 +1452,10 @@ def run_ground_truth_physics_baseline(
     return {
         "split": split,
         "n_triplets": float(n_samples),
-        "physics_mse": avg_loss,
+        "loss_2dns_mse": avg_phys,
+        "loss_smooth_space": avg_smooth_space,
+        "loss_smooth_time": avg_smooth_time,
+        "physics_mse": avg_phys,
         "residual_abs_mean": avg_abs_mean,
         "residual_abs_max_batch_avg": avg_abs_max,
         "dt_phys": dt_phys,
@@ -1416,7 +1469,7 @@ if __name__ == "__main__":
 
     _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     parser = argparse.ArgumentParser(
-        description="Ground-truth NS vorticity physics loss baseline (sanity check)."
+        description="Ground-truth 2DNS + smoothness loss baseline (sanity check, same as model.py)."
     )
     parser.add_argument(
         "--data",
