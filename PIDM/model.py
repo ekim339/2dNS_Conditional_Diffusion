@@ -80,6 +80,23 @@ def extract(a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tens
     return out
 
 
+def physics_mlflow_params(grid_size: int = 64) -> Dict[str, str]:
+  """Hardcoded PDE domain/forcing settings for MLflow (must match pde_residual)."""
+  dx = 1.0 / grid_size
+  return {
+      "physics_domain": "[0,1]^2 periodic",
+      "physics_grid_size": str(grid_size),
+      "physics_dx": str(dx),
+      "physics_dy": str(dx),
+      "physics_forcing": "f=[100*sin(8y), 0]^T",
+      "physics_forcing_curl_z": "-800*cos(8y)",
+  }
+
+
+def log_physics_mlflow_params(grid_size: int = 64) -> None:
+    mlflow.log_params(physics_mlflow_params(grid_size))
+
+
 # -------------------------
 # Dataset: fixed split, full 64x64 field used as both target x0 and condition y
 # -------------------------
@@ -546,6 +563,8 @@ class DDPMTrainer:
         total_loss = 0.0
         total_diff_loss = 0.0
         total_phys_loss = 0.0
+        total_smooth_space_loss = 0.0
+        total_smooth_time_loss = 0.0
         n = 0
         num_batches = len(loader)
         lambda_smooth_space = 1e-4
@@ -713,6 +732,8 @@ class DDPMTrainer:
             total_loss += float(loss.item()) * B
             total_diff_loss += float(loss_diff.item()) * B
             total_phys_loss += float(loss_phys.item()) * B
+            total_smooth_space_loss += float(loss_smooth_space.item()) * B
+            total_smooth_time_loss += float(loss_smooth_time.item()) * B
             n += B
 
             if (batch_idx + 1) % max(1, num_batches // 10) == 0 or (batch_idx + 1) % 10 == 0:
@@ -735,11 +756,21 @@ class DDPMTrainer:
         avg_loss = total_loss / max(n, 1)
         avg_diff_loss = total_diff_loss / max(n, 1)
         avg_phys_loss = total_phys_loss / max(n, 1)
+        avg_smooth_space_loss = total_smooth_space_loss / max(n, 1)
+        avg_smooth_time_loss = total_smooth_time_loss / max(n, 1)
         print(
             f"  Epoch {epoch} complete | Average Loss: {avg_loss:.6f} | "
-            f"Average Diff: {avg_diff_loss:.6f} | Average Phys: {avg_phys_loss:.6f}"
+            f"Average Diff: {avg_diff_loss:.6f} | Average Phys: {avg_phys_loss:.6f} | "
+            f"Spatial nonsmoothness: {avg_smooth_space_loss:.6f} | "
+            f"Time acceleration: {avg_smooth_time_loss:.6f}"
         )
-        return avg_loss, avg_diff_loss, avg_phys_loss
+        return (
+            avg_loss,
+            avg_diff_loss,
+            avg_phys_loss,
+            avg_smooth_space_loss,
+            avg_smooth_time_loss,
+        )
 
     @torch.no_grad()
     def eval_recon_mse(self, loader: DataLoader, num_batches: int = 2) -> float:
@@ -865,12 +896,15 @@ def run_training(
         mlflow.log_param("seed", seed)
         mlflow.log_param("train_mean", train_mean)
         mlflow.log_param("train_std", train_std)
+        log_physics_mlflow_params(grid_size=64)
 
         best_test = float("inf")
 
         for epoch in range(1, cfg.epochs + 1):
             t0 = time.time()
-            train_loss, train_loss_data, train_loss_physics = trainer.train_one_epoch(train_loader, epoch)
+            train_loss, train_loss_data, train_loss_physics, train_loss_spatial_nonsmoothness, train_loss_time_acceleration = (
+                trainer.train_one_epoch(train_loader, epoch)
+            )
 
             ckpt = {
                 "model": trainer.model.state_dict(),
@@ -892,11 +926,15 @@ def run_training(
             mlflow.log_metric("train_loss", float(train_loss), step=epoch)
             mlflow.log_metric("train_loss_data", float(train_loss_data), step=epoch)
             mlflow.log_metric("train_loss_physics", float(train_loss_physics), step=epoch)
+            mlflow.log_metric("train_loss_spatial_nonsmoothness", float(train_loss_spatial_nonsmoothness), step=epoch)
+            mlflow.log_metric("train_loss_time_acceleration", float(train_loss_time_acceleration), step=epoch)
             mlflow.log_metric("test_recon_mse", float(test_mse), step=epoch)
 
             print(
                 f"Epoch {epoch:03d} | train_loss={train_loss:.6f} "
-                f"(data={train_loss_data:.6f}, phys={train_loss_physics:.6f}) | "
+                f"(data={train_loss_data:.6f}, phys={train_loss_physics:.6f}, "
+                f"space={train_loss_spatial_nonsmoothness:.6f}, "
+                f"time_accel={train_loss_time_acceleration:.6f}) | "
                 f"test_recon_mse~={test_mse:.6f} | {dt:.1f}s"
             )
 
@@ -1105,11 +1143,14 @@ def run_training_resume(
             mlflow.log_param("train_mean", train_mean)
             mlflow.log_param("train_std", train_std)
             mlflow.log_param("additional_epochs", additional_epochs)
+            log_physics_mlflow_params(grid_size=64)
 
         for i in range(1, additional_epochs + 1):
             log_step = start_step + i
             t0 = time.time()
-            train_loss, train_loss_data, train_loss_physics = trainer.train_one_epoch(train_loader, i)
+            train_loss, train_loss_data, train_loss_physics, train_loss_spatial_nonsmoothness, train_loss_time_acceleration = (
+                trainer.train_one_epoch(train_loader, i)
+            )
 
             payload = {
                 "model": trainer.model.state_dict(),
@@ -1130,11 +1171,15 @@ def run_training_resume(
             mlflow.log_metric("train_loss", float(train_loss), step=log_step)
             mlflow.log_metric("train_loss_data", float(train_loss_data), step=log_step)
             mlflow.log_metric("train_loss_physics", float(train_loss_physics), step=log_step)
+            mlflow.log_metric("train_loss_spatial_nonsmoothness", float(train_loss_spatial_nonsmoothness), step=log_step)
+            mlflow.log_metric("train_loss_time_acceleration", float(train_loss_time_acceleration), step=log_step)
             mlflow.log_metric("test_recon_mse", float(test_mse), step=log_step)
 
             print(
                 f"Epoch (resume {i}/{additional_epochs}) global_step={log_step} | "
-                f"train_loss={train_loss:.6f} (data={train_loss_data:.6f}, phys={train_loss_physics:.6f}) | "
+                f"train_loss={train_loss:.6f} (data={train_loss_data:.6f}, phys={train_loss_physics:.6f}, "
+                f"space={train_loss_spatial_nonsmoothness:.6f}, "
+                f"time_accel={train_loss_time_acceleration:.6f}) | "
                 f"test_recon_mse~={test_mse:.6f} | {dt:.1f}s"
             )
 
