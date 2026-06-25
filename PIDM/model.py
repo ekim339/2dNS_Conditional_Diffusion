@@ -435,7 +435,7 @@ class DDPMTrainer:
         k2_safe[0, 0] = 1.0
 
         eps = 1e-6
-        psi_fft = -w_fft / (k2_safe + eps)
+        psi_fft = w_fft / (k2_safe + eps)
         psi_fft[..., 0, 0] = 0.0
 
         u = torch.fft.irfft2(1j * ky * psi_fft, s=(H, W))
@@ -453,8 +453,9 @@ class DDPMTrainer:
         lap_w = torch.fft.irfft2(lap_fft, s=(H, W))
 
         # f = [100 sin(8y), 0]^T => (curl f)_z = -800 cos(8y); y in physical coords [0,1)
-        y_phys = torch.arange(W, device=device, dtype=w_cur.dtype) * dy
-        forcing_vort = (-800.0 * torch.cos(8.0 * y_phys)).view(1, 1, W).expand(B, H, W)
+        y_phys = torch.arange(W, device=device, dtype=w_cur.dtype) / W
+        forcing_vort = -800.0 * math.pi * torch.cos(8.0 * math.pi * y_phys)
+        forcing_vort = forcing_vort.view(1, 1, W).expand(B, H, W)
 
         w_t = (w_next - w_prev) / (2.0 * dt)
         R = w_t + u * w_x + v * w_y - nu * lap_w - forcing_vort
