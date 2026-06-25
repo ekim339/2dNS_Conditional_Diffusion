@@ -80,7 +80,7 @@ def extract(a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tens
     return out
 
 
-def physics_mlflow_params(grid_size: int = 64) -> Dict[str, str]:
+def physics_mlflow_params(grid_size: int = 64, dt_phys: float = 0.01) -> Dict[str, str]:
   """Hardcoded PDE domain/forcing settings for MLflow (must match pde_residual)."""
   dx = 1.0 / grid_size
   return {
@@ -88,13 +88,14 @@ def physics_mlflow_params(grid_size: int = 64) -> Dict[str, str]:
       "physics_grid_size": str(grid_size),
       "physics_dx": str(dx),
       "physics_dy": str(dx),
+      "physics_dt_phys": str(dt_phys),
       "physics_forcing": "f=[100*sin(8y), 0]^T",
       "physics_forcing_curl_z": "-800*cos(8y)",
   }
 
 
-def log_physics_mlflow_params(grid_size: int = 64) -> None:
-    mlflow.log_params(physics_mlflow_params(grid_size))
+def log_physics_mlflow_params(grid_size: int = 64, dt_phys: float = 0.01) -> None:
+    mlflow.log_params(physics_mlflow_params(grid_size, dt_phys))
 
 
 # -------------------------
@@ -404,6 +405,7 @@ class DDPMTrainer:
             f = [100 sin(8y), 0]^T
         Uses central difference in time and spectral spatial derivatives (FFT).
         Grid spacing on [0,1]^2: dx = dy = 1/64 (for H=W=64).
+        Time step between consecutive stored frames: dt_phys = 0.01.
         """
         dt = self.dt
         nu = self.cfg.viscosity
@@ -848,6 +850,7 @@ def run_training(
         epochs=30,
         guidance_scale=1.0,
         use_amp=True,
+        dt_phys=0.01,
     )
 
     train_loader = DataLoader(
@@ -878,6 +881,7 @@ def run_training(
     print(f"Dataset: {N} samples ({n_train} train, {N - n_train} test)")
     print(f"Batch size: {cfg.batch_size}")
     print(f"Epochs: {cfg.epochs}")
+    print(f"Physics dt_phys: {cfg.dt_phys}")
     print(f"Device: {device}")
     print(f"Checkpoint directory: {os.path.abspath(out_dir)}")
     print(f"Checkpoint will be saved to: {os.path.abspath(ckpt_path)}")
@@ -896,7 +900,7 @@ def run_training(
         mlflow.log_param("seed", seed)
         mlflow.log_param("train_mean", train_mean)
         mlflow.log_param("train_std", train_std)
-        log_physics_mlflow_params(grid_size=64)
+        log_physics_mlflow_params(grid_size=64, dt_phys=cfg.dt_phys)
 
         best_test = float("inf")
 
@@ -1143,7 +1147,7 @@ def run_training_resume(
             mlflow.log_param("train_mean", train_mean)
             mlflow.log_param("train_std", train_std)
             mlflow.log_param("additional_epochs", additional_epochs)
-            log_physics_mlflow_params(grid_size=64)
+            log_physics_mlflow_params(grid_size=64, dt_phys=cfg.dt_phys)
 
         for i in range(1, additional_epochs + 1):
             log_step = start_step + i
