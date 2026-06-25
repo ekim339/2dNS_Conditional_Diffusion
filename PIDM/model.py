@@ -332,7 +332,7 @@ class DiffusionConfig:
     lambda_phys_max: float = 5e-9
     lambda_phys_warmup_ratio: float = 0.5
     dt_phys: float = 1e-3
-    viscosity: float = 1e-3
+    viscosity: float = 1e-4
     # Low-pass cutoff in angular wavenumber |k| for physics loss (None = full spectrum).
     low_freq_k_cutoff: Optional[float] = 2.0
 
@@ -382,8 +382,11 @@ class DDPMTrainer:
     ) -> torch.Tensor:
         """
         2D incompressible Navier-Stokes vorticity residual:
-            dω/dt + u * dω/dx + v * dω/dy - ν * ∇²ω
+            dω/dt + u * dω/dx + v * dω/dy - ν * ∇²ω - (curl f)_z
+        with forcing:
+            f = [100 sin(8y), 0]^T
         Uses central difference in time and spectral spatial derivatives (FFT).
+        Grid spacing on [0,1]^2: dx = dy = 1/64 (for H=W=64).
         """
         dt = self.dt
         nu = self.cfg.viscosity
@@ -394,9 +397,11 @@ class DDPMTrainer:
 
         B, H, W = w_cur.shape
         device = w_cur.device
+        dx = 1.0 / H
+        dy = 1.0 / W
 
-        kx = (2 * math.pi) * torch.fft.fftfreq(H, device=device).view(H, 1)
-        ky = (2 * math.pi) * torch.fft.rfftfreq(W, device=device).view(1, W // 2 + 1)
+        kx = (2 * math.pi) * torch.fft.fftfreq(H, d=dx, device=device).view(H, 1)
+        ky = (2 * math.pi) * torch.fft.rfftfreq(W, d=dy, device=device).view(1, W // 2 + 1)
 
         k2 = kx**2 + ky**2
         k_cutoff = self.cfg.low_freq_k_cutoff
@@ -428,8 +433,12 @@ class DDPMTrainer:
         #lap_fft = torch.clamp(lap_fft.real, -1e6, 1e6) + 1j * torch.clamp(lap_fft.imag, -1e6, 1e6)
         lap_w = torch.fft.irfft2(lap_fft, s=(H, W))
 
+        # f = [100 sin(8y), 0]^T => (curl f)_z = -800 cos(8y); y in physical coords [0,1)
+        y_phys = torch.arange(W, device=device, dtype=w_cur.dtype) * dy
+        forcing_vort = (-800.0 * torch.cos(8.0 * y_phys)).view(1, 1, W).expand(B, H, W)
+
         w_t = (w_next - w_prev) / (2.0 * dt)
-        R = w_t + u * w_x + v * w_y - nu * lap_w
+        R = w_t + u * w_x + v * w_y - nu * lap_w - forcing_vort
         return R.unsqueeze(1)
 
     def p_mean_variance(self, x_t: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
