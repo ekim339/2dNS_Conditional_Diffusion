@@ -1289,7 +1289,7 @@ def run_ground_truth_physics_baseline(
     train_std: Optional[float] = None,
     dt_phys: float = 0.01,
     viscosity: float = 1e-4,
-    low_freq_k_cutoff: Optional[float] = 2.0,
+    low_freq_k_cutoff: Optional[float] = None,
     seed: int = 0,
 ) -> Dict[str, float]:
     """
@@ -1516,8 +1516,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--low-freq-k-cutoff",
         type=float,
-        default=2.0,
-        help="Low-pass |k| cutoff for residual (same as DiffusionConfig).",
+        default=None,
+        help="Low-pass |k| cutoff for residual (None = full spectrum).",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
