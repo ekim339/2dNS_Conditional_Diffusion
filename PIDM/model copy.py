@@ -380,7 +380,7 @@ class DDPMTrainer:
         """
         2D incompressible Navier-Stokes vorticity residual:
             dω/dt + u * dω/dx + v * dω/dy - ν * ∇²ω - (curl f)_z
-        with forcing f = [100 sin(8y), 0]^T.
+        with forcing f = [100 sin(8πy), 0]^T.
         Grid spacing on [0,1]^2: dx = dy = 1/64 (for H=W=64).
         """
         dt = self.dt
@@ -411,7 +411,7 @@ class DDPMTrainer:
         k2_safe[0, 0] = 1.0
 
         eps = 1e-6
-        psi_fft = -w_fft / (k2_safe + eps)
+        psi_fft = w_fft / (k2_safe + eps)
         psi_fft[..., 0, 0] = 0.0
 
         u = torch.fft.irfft2(1j * ky * psi_fft, s=(H, W))
@@ -428,8 +428,9 @@ class DDPMTrainer:
         #lap_fft = torch.clamp(lap_fft.real, -1e6, 1e6) + 1j * torch.clamp(lap_fft.imag, -1e6, 1e6)
         lap_w = torch.fft.irfft2(lap_fft, s=(H, W))
 
-        y_phys = torch.arange(W, device=device, dtype=w_cur.dtype) * dy
-        forcing_vort = (-800.0 * torch.cos(8.0 * y_phys)).view(1, 1, W).expand(B, H, W)
+        y_phys = torch.arange(W, device=device, dtype=w_cur.dtype) / W
+        forcing_vort = -800.0 * math.pi * torch.cos(8.0 * math.pi * y_phys)
+        forcing_vort = forcing_vort.view(1, 1, W).expand(B, H, W)
 
         w_t = (w_next - w_prev) / (2.0 * dt)
         R = w_t + u * w_x + v * w_y - nu * lap_w - forcing_vort
@@ -1368,7 +1369,7 @@ def run_ground_truth_physics_baseline(
     print(f"Evaluating: {n_eval} random triplet samples (seed={seed})")
     print(f"train_mean={train_mean:.6f}, train_std={train_std:.6f} (denorm: x_phys = x_norm * std + mean)")
     print(f"dt_phys={dt_phys}, viscosity={viscosity}, low_freq_k_cutoff={low_freq_k_cutoff}")
-    print("physics_domain=[0,1]^2 periodic, dx=dy=1/64, forcing=f=[100*sin(8y),0]^T")
+    print("physics_domain=[0,1]^2 periodic, dx=dy=1/64, forcing=f=[100*sin(8πy),0]^T")
     print(f"batch_size={batch_size}")
     print(f"{'='*60}\n")
 
