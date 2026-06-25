@@ -328,7 +328,7 @@ class DiffusionConfig:
     guidance_scale: float = 1.0  # CFG sampling scale
     use_amp: bool = True
     lambda_phys: float = 5e-9
-    dt_phys: float = 1e-3
+    dt_phys: float = 0.01
     viscosity: float = 1e-4
     # Low-pass cutoff in angular wavenumber |k| for physics loss (None = full spectrum).
     low_freq_k_cutoff: Optional[float] = 2.0
@@ -1287,7 +1287,7 @@ def run_ground_truth_physics_baseline(
     max_batches: Optional[int] = None,
     train_mean: Optional[float] = None,
     train_std: Optional[float] = None,
-    dt_phys: float = 1e-3,
+    dt_phys: float = 0.01,
     viscosity: float = 1e-4,
     low_freq_k_cutoff: Optional[float] = 2.0,
     seed: int = 0,
@@ -1511,7 +1511,7 @@ if __name__ == "__main__":
         default=None,
         help="Limit number of batches (for quick smoke tests).",
     )
-    parser.add_argument("--dt-phys", type=float, default=1e-3)
+    parser.add_argument("--dt-phys", type=float, default=0.01)
     parser.add_argument("--viscosity", type=float, default=1e-4)
     parser.add_argument(
         "--low-freq-k-cutoff",
