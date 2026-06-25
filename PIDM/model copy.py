@@ -1288,7 +1288,7 @@ def run_ground_truth_physics_baseline(
     train_mean: Optional[float] = None,
     train_std: Optional[float] = None,
     dt_phys: float = 1e-3,
-    viscosity: float = 1e-3,
+    viscosity: float = 1e-4,
     low_freq_k_cutoff: Optional[float] = 2.0,
     seed: int = 0,
 ) -> Dict[str, float]:
@@ -1368,6 +1368,7 @@ def run_ground_truth_physics_baseline(
     print(f"Evaluating: {n_eval} random triplet samples (seed={seed})")
     print(f"train_mean={train_mean:.6f}, train_std={train_std:.6f} (denorm: x_phys = x_norm * std + mean)")
     print(f"dt_phys={dt_phys}, viscosity={viscosity}, low_freq_k_cutoff={low_freq_k_cutoff}")
+    print("physics_domain=[0,1]^2 periodic, dx=dy=1/64, forcing=f=[100*sin(8y),0]^T")
     print(f"batch_size={batch_size}")
     print(f"{'='*60}\n")
 
@@ -1467,6 +1468,10 @@ def run_ground_truth_physics_baseline(
         "per_sample_loss_smooth_time": per_sample_smooth_time,
         "dt_phys": dt_phys,
         "viscosity": viscosity,
+        "physics_domain": "[0,1]^2 periodic",
+        "physics_dx": 1.0 / 64,
+        "physics_dy": 1.0 / 64,
+        "physics_forcing": "f=[100*sin(8y), 0]^T",
         "low_freq_k_cutoff": low_freq_k_cutoff if low_freq_k_cutoff is not None else -1.0,
         "train_mean": train_mean,
         "train_std": train_std,
@@ -1507,7 +1512,7 @@ if __name__ == "__main__":
         help="Limit number of batches (for quick smoke tests).",
     )
     parser.add_argument("--dt-phys", type=float, default=1e-3)
-    parser.add_argument("--viscosity", type=float, default=1e-3)
+    parser.add_argument("--viscosity", type=float, default=1e-4)
     parser.add_argument(
         "--low-freq-k-cutoff",
         type=float,
