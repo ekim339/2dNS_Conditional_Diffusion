@@ -346,13 +346,13 @@ class DiffusionConfig:
     guidance_scale: float = 1.0  # CFG sampling scale
     use_amp: bool = True
     #lambda_phys: float = 5e-9
-    lambda_phys_start: float = 5e-11
-    lambda_phys_max: float = 5e-9
+    lambda_phys_start: float = 1e-8
+    lambda_phys_max: float = 5e-8
     lambda_phys_warmup_ratio: float = 0.5
     dt_phys: float = 0.01
     viscosity: float = 1e-4
     # Low-pass cutoff in angular wavenumber |k| for physics loss (None = full spectrum).
-    low_freq_k_cutoff: Optional[float] = 2.0
+    low_freq_k_cutoff: Optional[float] = 2 * math.pi * 2
 
 
 class DDPMTrainer:
