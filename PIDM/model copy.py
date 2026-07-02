@@ -1221,6 +1221,158 @@ def load_and_sample(
 # -------------------------
 # Ground-truth physics loss baseline (sanity check)
 # -------------------------
+def _field_stats(t: torch.Tensor) -> str:
+    """One-line summary for a 2D field or batch of 2D fields."""
+    x = t.detach().float()
+    if x.ndim == 3:
+        x = x[0]
+    elif x.ndim == 4:
+        x = x[0, 0]
+    return (
+        f"mean={x.mean().item():.6e}, std={x.std().item():.6e}, "
+        f"min={x.min().item():.6e}, max={x.max().item():.6e}, "
+        f"absmax={x.abs().max().item():.6e}"
+    )
+
+
+def _print_field_slice(name: str, t: torch.Tensor, row: int = 32, col0: int = 30, width: int = 5) -> None:
+    """Print a small spatial patch from the center of the grid."""
+    x = t.detach().float()
+    if x.ndim == 3:
+        patch = x[0, row, col0 : col0 + width]
+    elif x.ndim == 4:
+        patch = x[0, 0, row, col0 : col0 + width]
+    else:
+        patch = x.flatten()[:width]
+    vals = ", ".join(f"{v:.4e}" for v in patch.cpu().tolist())
+    print(f"    {name} patch[row={row}, col {col0}:{col0 + width - 1}]: [{vals}]")
+
+
+@torch.no_grad()
+def print_residual_breakdown(
+    cfg: DiffusionConfig,
+    device: torch.device,
+    omega_prev_phys: torch.Tensor,
+    omega_cur_phys: torch.Tensor,
+    omega_next_phys: torch.Tensor,
+    triplet_start_idx: int,
+) -> torch.Tensor:
+    """
+    Walk through each step of pde_residual for one sample and print intermediates.
+    Mirrors DDPMTrainer.pde_residual (same formulas as model.py / model copy.py).
+    """
+    dt = cfg.dt_phys
+    nu = cfg.viscosity
+
+    w_prev = omega_prev_phys.squeeze(1).to(device)
+    w_cur = omega_cur_phys.squeeze(1).to(device)
+    w_next = omega_next_phys.squeeze(1).to(device)
+
+    B, H, W = w_cur.shape
+    dx = 1.0 / H
+    dy = 1.0 / W
+
+    sep = "=" * 72
+    print(f"\n{sep}")
+    print("RESIDUAL BREAKDOWN (single ground-truth triplet)")
+    print(sep)
+    print(f"  Triplet raw frame indices: {triplet_start_idx}, {triplet_start_idx + 1}, {triplet_start_idx + 2}")
+    print(f"  -> omega_{{k-1}}, omega_k, omega_{{k+1}}")
+    print(f"  dt_phys={dt}, viscosity={nu}, dx={dx:.6f}, dy={dy:.6f}")
+    print(f"  low_freq_k_cutoff={cfg.low_freq_k_cutoff}")
+    print(f"  Residual: R = dω/dt + u*dω/dx + v*dω/dy - nu*∇²ω - f_ω")
+    print(sep)
+
+    print("\n[1] Input vorticity (physical units, before low-pass)")
+    print(f"    omega_k-1: {_field_stats(w_prev)}")
+    _print_field_slice("omega_k-1", w_prev)
+    print(f"    omega_k:   {_field_stats(w_cur)}")
+    _print_field_slice("omega_k", w_cur)
+    print(f"    omega_k+1: {_field_stats(w_next)}")
+    _print_field_slice("omega_k+1", w_next)
+
+    kx = (2 * math.pi) * torch.fft.fftfreq(H, d=dx, device=device).view(H, 1)
+    ky = (2 * math.pi) * torch.fft.rfftfreq(W, d=dy, device=device).view(1, W // 2 + 1)
+    k2 = kx**2 + ky**2
+
+    k_cutoff = cfg.low_freq_k_cutoff
+    if k_cutoff is not None and k_cutoff > 0:
+        low_mask = (k2 < (float(k_cutoff) ** 2)).to(dtype=torch.float32)
+        w_prev = torch.fft.irfft2(torch.fft.rfft2(w_prev) * low_mask, s=(H, W))
+        w_cur = torch.fft.irfft2(torch.fft.rfft2(w_cur) * low_mask, s=(H, W))
+        w_next = torch.fft.irfft2(torch.fft.rfft2(w_next) * low_mask, s=(H, W))
+        print(f"\n[2] Low-pass filter applied (|k| < {k_cutoff})")
+        print(f"    omega_k (filtered): {_field_stats(w_cur)}")
+    else:
+        print("\n[2] Low-pass filter: skipped (full spectrum)")
+
+    w_fft = torch.fft.rfft2(w_cur)
+    k2_safe = k2.clone()
+    k2_safe[0, 0] = 1.0
+    eps = 1e-6
+    psi_fft = w_fft / (k2_safe + eps)
+    psi_fft[..., 0, 0] = 0.0
+
+    u = torch.fft.irfft2(1j * ky * psi_fft, s=(H, W))
+    v = torch.fft.irfft2(-1j * kx * psi_fft, s=(H, W))
+
+    print("\n[3] Velocity from streamfunction (at center frame omega_k)")
+    print(f"    u: {_field_stats(u)}")
+    _print_field_slice("u", u)
+    print(f"    v: {_field_stats(v)}")
+    _print_field_slice("v", v)
+
+    w_x = torch.fft.irfft2(1j * kx * w_fft, s=(H, W))
+    w_y = torch.fft.irfft2(1j * ky * w_fft, s=(H, W))
+
+    print("\n[4] Spatial derivatives of omega_k (spectral)")
+    print(f"    dω/dx: {_field_stats(w_x)}")
+    _print_field_slice("dω/dx", w_x)
+    print(f"    dω/dy: {_field_stats(w_y)}")
+    _print_field_slice("dω/dy", w_y)
+
+    lap_fft = -(kx**2 + ky**2) * w_fft
+    lap_w = torch.fft.irfft2(lap_fft, s=(H, W))
+
+    print("\n[5] Laplacian of omega_k")
+    print(f"    ∇²ω: {_field_stats(lap_w)}")
+    _print_field_slice("∇²ω", lap_w)
+
+    y_phys = torch.arange(W, device=device, dtype=w_cur.dtype) / W
+    forcing_vort = -800.0 * math.pi * torch.cos(8.0 * math.pi * y_phys)
+    forcing_vort = forcing_vort.view(1, 1, W).expand(B, H, W)
+
+    print("\n[6] Forcing term f_ω = (curl f)_z")
+    print(f"    f_ω: {_field_stats(forcing_vort)}")
+    _print_field_slice("f_ω", forcing_vort)
+
+    w_t = (w_next - w_prev) / (2.0 * dt)
+    adv = u * w_x + v * w_y
+    visc = -nu * lap_w
+
+    print("\n[7] Time derivative (central difference)")
+    print(f"    dω/dt = (omega_k+1 - omega_k-1) / (2*dt): {_field_stats(w_t)}")
+    _print_field_slice("dω/dt", w_t)
+
+    print("\n[8] PDE terms combined")
+    print(f"    advection  u*dω/dx + v*dω/dy: {_field_stats(adv)}")
+    print(f"    diffusion -nu*∇²ω:            {_field_stats(visc)}")
+    print(f"    -(forcing) -f_ω:              {_field_stats(-forcing_vort)}")
+
+    R = w_t + adv + visc - forcing_vort
+    loss_phys = F.mse_loss(R.unsqueeze(1), torch.zeros_like(R.unsqueeze(1)))
+
+    print("\n[9] Final residual R")
+    print(f"    R: {_field_stats(R)}")
+    _print_field_slice("R", R)
+    print(f"    |R| mean: {R.abs().mean().item():.6e}")
+    print(f"    |R| max:  {R.abs().max().item():.6e}")
+    print(f"    loss_phys = MSE(R, 0) = mean(R^2): {loss_phys.item():.6e}")
+    print(f"{sep}\n")
+
+    return R.unsqueeze(1)
+
+
 class GroundTruthPhysicsEvaluator:
     """
     Ground-truth diagnostics on true (k-1, k, k+1) fields in physical units.
@@ -1353,6 +1505,13 @@ def run_ground_truth_physics_baseline(
         low_freq_k_cutoff=low_freq_k_cutoff,
     )
     trainer = GroundTruthPhysicsEvaluator(cfg, device)
+
+    # Debug: print full residual walkthrough for the first evaluated triplet
+    first_idx = int(triplet_indices[0])
+    omega_prev_dbg = _raw_frames_to_physical(fields[first_idx : first_idx + 1], train_mean, train_std, device)
+    omega_cur_dbg = _raw_frames_to_physical(fields[first_idx + 1 : first_idx + 2], train_mean, train_std, device)
+    omega_next_dbg = _raw_frames_to_physical(fields[first_idx + 2 : first_idx + 3], train_mean, train_std, device)
+    print_residual_breakdown(cfg, device, omega_prev_dbg, omega_cur_dbg, omega_next_dbg, triplet_start_idx=first_idx)
 
     phys_list = []
     smooth_space_list = []
