@@ -349,9 +349,9 @@ class DiffusionConfig:
     guidance_scale: float = 1.0  # CFG sampling scale
     use_amp: bool = True
     #lambda_phys: float = 5e-9
-    lambda_phys_start: float = 1e-8
-    lambda_phys_max: float = 5e-8
-    lambda_phys_warmup_ratio: float = 0.5
+    lambda_phys_start: float = 1e-14
+    lambda_phys_max: float = 1e-10
+    lambda_phys_warmup_ratio: float = 0.8
     dt_phys: float = 0.001
     viscosity: float = 1e-4
     # calc_nse_loss.py uses the full spectrum by default.
@@ -607,8 +607,8 @@ class DDPMTrainer:
         total_smooth_time_loss = 0.0
         n = 0
         num_batches = len(loader)
-        lambda_smooth_space = 1e-4
-        lambda_smooth_time = 5e-5
+        lambda_smooth_space = 1e-7
+        lambda_smooth_time = 2e-6
 
         print(f"  Starting epoch {epoch} ({num_batches} batches)...")
 
