@@ -83,14 +83,17 @@ def extract(a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tens
 def physics_mlflow_params(grid_size: int = 64, dt_phys: float = 0.01) -> Dict[str, str]:
   """Hardcoded PDE domain/forcing settings for MLflow (must match pde_residual)."""
   dx = 1.0 / grid_size
+  grid_extent = (grid_size - 1) / grid_size
   return {
       "physics_domain": "[0,1]^2 periodic",
       "physics_grid_size": str(grid_size),
       "physics_dx": str(dx),
       "physics_dy": str(dx),
+      "physics_grid_extent": str(grid_extent),
       "physics_dt_phys": str(dt_phys),
-      "physics_forcing": "f=[100*sin(8y), 0]^T",
-      "physics_forcing_curl_z": "-800*cos(8y)",
+      "physics_derivative_convention": "simulator FFT-index units",
+      "physics_forcing": "sampled f=[100*sin(8*pi*y), 0]^T",
+      "physics_forcing_curl_z": "spectral curl of sampled force",
   }
 
 
@@ -351,8 +354,8 @@ class DiffusionConfig:
     lambda_phys_warmup_ratio: float = 0.5
     dt_phys: float = 0.01
     viscosity: float = 1e-4
-    # Low-pass cutoff in angular wavenumber |k| for physics loss (None = full spectrum).
-    low_freq_k_cutoff: Optional[float] = 2 * math.pi * 2
+    # calc_nse_loss.py uses the full spectrum by default.
+    low_freq_k_cutoff: Optional[float] = None
 
 
 class DDPMTrainer:
@@ -392,6 +395,72 @@ class DDPMTrainer:
         return extract(self.sqrt_alphas_cumprod, t, x0.shape) * x0 + \
                extract(self.sqrt_one_minus_alphas_cumprod, t, x0.shape) * noise
 
+    @staticmethod
+    def _nse_wavenumbers(
+        nx: int,
+        ny: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        kx_1d = torch.fft.fftfreq(nx, d=1.0 / nx, device=device)
+        ky_1d = torch.fft.fftfreq(ny, d=1.0 / ny, device=device)
+        kx = kx_1d.to(dtype).reshape(1, nx, 1)
+        ky = ky_1d.to(dtype).reshape(1, 1, ny)
+        k2 = kx**2 + ky**2
+        k2[:, 0, 0] = 1.0
+        return kx, ky, k2
+
+    def _nse_gradient(self, field: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        kx, ky, _ = self._nse_wavenumbers(
+            field.shape[1],
+            field.shape[2],
+            field.device,
+            field.dtype,
+        )
+        field_hat = torch.fft.fft2(field)
+        field_x = torch.fft.ifft2(1j * kx * field_hat).real
+        field_y = torch.fft.ifft2(1j * ky * field_hat).real
+        return field_x, field_y
+
+    def _nse_laplacian(self, field: torch.Tensor) -> torch.Tensor:
+        _, _, k2 = self._nse_wavenumbers(
+            field.shape[1],
+            field.shape[2],
+            field.device,
+            field.dtype,
+        )
+        field_hat = torch.fft.fft2(field)
+        return torch.fft.ifft2(-k2 * field_hat).real
+
+    def _nse_velocity_from_vorticity(self, omega: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        kx, ky, k2 = self._nse_wavenumbers(
+            omega.shape[1],
+            omega.shape[2],
+            omega.device,
+            omega.dtype,
+        )
+        omega_hat = torch.fft.fft2(omega)
+        psi_hat = omega_hat / k2
+        psi_hat[:, 0, 0] = 0.0
+        velocity_x = torch.fft.ifft2(1j * ky * psi_hat).real
+        velocity_y = torch.fft.ifft2(-1j * kx * psi_hat).real
+        return velocity_x, velocity_y
+
+    def _nse_curl_forcing(
+        self,
+        batch_size: int,
+        nx: int,
+        ny: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        grid_extent = (ny - 1) / ny
+        y = grid_extent * torch.arange(ny, device=device, dtype=dtype) / (ny - 1)
+        force_x = 100.0 * torch.sin(8.0 * math.pi * y)
+        force_x = force_x.reshape(1, 1, ny).expand(batch_size, nx, ny)
+        _, force_x_y = self._nse_gradient(force_x)
+        return -force_x_y
+
     def pde_residual(
         self,
         omega_k_minus_1: torch.Tensor,
@@ -399,13 +468,15 @@ class DDPMTrainer:
         omega_k_plus_1: torch.Tensor,
     ) -> torch.Tensor:
         """
-        2D incompressible Navier-Stokes vorticity residual:
+        Same centered PDE residual as NSE/calc_nse_loss.py:
             dω/dt + u * dω/dx + v * dω/dy - ν * ∇²ω - (curl f)_z
-        with forcing:
-            f = [100 sin(8y), 0]^T
-        Uses central difference in time and spectral spatial derivatives (FFT).
-        Grid spacing on [0,1]^2: dx = dy = 1/64 (for H=W=64).
-        Time step between consecutive stored frames: dt_phys = 0.01.
+
+        Alignment details:
+        - FFT-index derivatives, not 2*pi-scaled physical derivatives.
+        - Full-spectrum fft2 derivatives by default.
+        - curl(f) is the spectral curl of the sampled force array
+          f_x = 100*sin(8*pi*y), not an analytic cosine formula.
+        - y-grid is 0, 1/64, ..., 63/64 as in NSE_Simulation_64.jl.
         """
         dt = self.dt
         nu = self.cfg.viscosity
@@ -415,49 +486,15 @@ class DDPMTrainer:
         w_next = omega_k_plus_1.squeeze(1)
 
         B, H, W = w_cur.shape
-        device = w_cur.device
-        dx = 1.0 / H
-        dy = 1.0 / W
-
-        kx = (2 * math.pi) * torch.fft.fftfreq(H, d=dx, device=device).view(H, 1)
-        ky = (2 * math.pi) * torch.fft.rfftfreq(W, d=dy, device=device).view(1, W // 2 + 1)
-
-        k2 = kx**2 + ky**2
-        k_cutoff = self.cfg.low_freq_k_cutoff
-        if k_cutoff is not None and k_cutoff > 0:
-            low_mask = (k2 < (float(k_cutoff) ** 2)).to(dtype=torch.float32)
-            w_prev = torch.fft.irfft2(torch.fft.rfft2(w_prev) * low_mask, s=(H, W))
-            w_cur = torch.fft.irfft2(torch.fft.rfft2(w_cur) * low_mask, s=(H, W))
-            w_next = torch.fft.irfft2(torch.fft.rfft2(w_next) * low_mask, s=(H, W))
-
-        w_fft = torch.fft.rfft2(w_cur)
-        k2_safe = k2.clone()
-        k2_safe[0, 0] = 1.0
-
-        eps = 1e-6
-        psi_fft = w_fft / (k2_safe + eps)
-        psi_fft[..., 0, 0] = 0.0
-
-        u = torch.fft.irfft2(1j * ky * psi_fft, s=(H, W))
-        v = torch.fft.irfft2(-1j * kx * psi_fft, s=(H, W))
-        #u = torch.clamp(u, -10.0, 10.0)
-        #v = torch.clamp(v, -10.0, 10.0)
-
-        w_x = torch.fft.irfft2(1j * kx * w_fft, s=(H, W))
-        w_y = torch.fft.irfft2(1j * ky * w_fft, s=(H, W))
-        #w_x = torch.clamp(w_x, -100.0, 100.0)
-        #w_y = torch.clamp(w_y, -100.0, 100.0)
-
-        lap_fft = -(kx**2 + ky**2) * w_fft
-        #lap_fft = torch.clamp(lap_fft.real, -1e6, 1e6) + 1j * torch.clamp(lap_fft.imag, -1e6, 1e6)
-        lap_w = torch.fft.irfft2(lap_fft, s=(H, W))
-
-        # f = [100 sin(8y), 0]^T => (curl f)_z = -800 cos(8y); y in physical coords [0,1)
-        y_phys = torch.arange(W, device=device, dtype=w_cur.dtype) / W
-        forcing_vort = -800.0 * math.pi * torch.cos(8.0 * math.pi * y_phys)
-        forcing_vort = forcing_vort.view(1, 1, W).expand(B, H, W)
+        if H != 64 or W != 64:
+            raise ValueError(f"Expected 64x64 vorticity fields, got {H}x{W}")
 
         w_t = (w_next - w_prev) / (2.0 * dt)
+        u, v = self._nse_velocity_from_vorticity(w_cur)
+        w_x, w_y = self._nse_gradient(w_cur)
+        lap_w = self._nse_laplacian(w_cur)
+        forcing_vort = self._nse_curl_forcing(B, H, W, w_cur.device, w_cur.dtype)
+
         R = w_t + u * w_x + v * w_y - nu * lap_w - forcing_vort
         return R.unsqueeze(1)
 
