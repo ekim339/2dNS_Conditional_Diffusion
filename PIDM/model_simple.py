@@ -11,6 +11,7 @@
 # - Trains conditional DDPM with optional CFG dropout.
 # - Physics loss: predict vorticity at k-1, k, k+1 and penalize the 2D NS
 #   vorticity residual (central time derivative + spectral advection/diffusion).
+# - Simple objective: data/noise-prediction loss + NSE residual loss only.
 #
 # Notes:
 # - U-Net input: cat([x_t, sparse_field, mask], dim=1) -> 3 channels.
@@ -80,7 +81,7 @@ def extract(a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tens
     return out
 
 
-def physics_mlflow_params(grid_size: int = 64, dt_phys: float = 0.001) -> Dict[str, str]:
+def physics_mlflow_params(grid_size: int = 64, dt_phys: float = 0.01) -> Dict[str, str]:
   """Hardcoded PDE domain/forcing settings for MLflow (must match pde_residual)."""
   dx = 1.0 / grid_size
   grid_extent = (grid_size - 1) / grid_size
@@ -97,7 +98,7 @@ def physics_mlflow_params(grid_size: int = 64, dt_phys: float = 0.001) -> Dict[s
   }
 
 
-def log_physics_mlflow_params(grid_size: int = 64, dt_phys: float = 0.001) -> None:
+def log_physics_mlflow_params(grid_size: int = 64, dt_phys: float = 0.01) -> None:
     mlflow.log_params(physics_mlflow_params(grid_size, dt_phys))
 
 
@@ -352,12 +353,8 @@ class DiffusionConfig:
     lambda_phys_start: float = 1e-8
     lambda_phys_max: float = 5e-8
     lambda_phys_warmup_ratio: float = 0.5
-    dt_phys: float = 0.001
+    dt_phys: float = 0.01
     viscosity: float = 1e-4
-    # calc_nse_loss.py uses the full spectrum by default.
-    low_freq_k_cutoff: Optional[float] = None
-
-
 class DDPMTrainer:
     def __init__(
         self,
@@ -570,24 +567,6 @@ class DDPMTrainer:
 
         return x
 
-    def spatial_smoothness_loss(self, w):
-        """
-        w: (B, 1, H, W)
-        Penalizes nonsmooth behavior in x and y directions.
-        """
-        dx = w[:, :, :, 1:] - w[:, :, :, :-1]
-        dy = w[:, :, 1:, :] - w[:, :, :-1, :]
-        return (dx ** 2).mean() + (dy ** 2).mean()
-
-    def temporal_second_difference_loss(self, w_prev, w_cur, w_next):
-        """
-        Penalizes nonsmooth acceleration in time:
-        w_{k+1} - 2w_k + w_{k-1}
-        """
-        dtt = w_next - 2.0 * w_cur + w_prev
-        return (dtt ** 2).mean()
-
-
     @staticmethod
     def get_lambda_phys(epoch, total_epochs, lambda_start, lambda_max, warmup_ratio=0.5):
         warmup_epochs = max(1, int(total_epochs * warmup_ratio))
@@ -603,12 +582,8 @@ class DDPMTrainer:
         total_loss = 0.0
         total_diff_loss = 0.0
         total_phys_loss = 0.0
-        total_smooth_space_loss = 0.0
-        total_smooth_time_loss = 0.0
         n = 0
         num_batches = len(loader)
-        lambda_smooth_space = 1e-4
-        lambda_smooth_time = 5e-5
 
         print(f"  Starting epoch {epoch} ({num_batches} batches)...")
 
@@ -678,19 +653,10 @@ class DDPMTrainer:
                     omega_prev_phys = x_prev_pred * scale + self.data_mean
                     omega_next_phys = x_next_pred * scale + self.data_mean
 
-                    loss_smooth_space = self.spatial_smoothness_loss(x0_phys)
-                    loss_smooth_time = self.temporal_second_difference_loss(
-                        omega_prev_phys,
-                        x0_phys,
-                        omega_next_phys,
-                    )
-
                     residual = self.pde_residual(omega_prev_phys, x0_phys, omega_next_phys)
                     loss_phys = F.mse_loss(residual, torch.zeros_like(residual))
                 else:
                     loss_phys = torch.tensor(0.0, device=x_t.device)
-                    loss_smooth_space = torch.tensor(0.0, device=x_t.device)
-                    loss_smooth_time = torch.tensor(0.0, device=x_t.device)
                     residual = None
 
                 lambda_phys_epoch = self.get_lambda_phys(
@@ -714,8 +680,6 @@ class DDPMTrainer:
                         print(f"loss_phys:        {loss_phys.item():.6e}")
                         print(f"loss_phys weighted raw: {weighted_phys_raw.item():.6e}")
                         print(f"loss_phys weighted cap: {weighted_phys.item():.6e}")
-                        print(f"loss_smooth_space:{loss_smooth_space.item():.6e}")
-                        print(f"loss_smooth_time: {loss_smooth_time.item():.6e}")
 
                         print("\nResidual stats:")
                         print(f"  residual abs mean: {residual.abs().mean().item():.6e}")
@@ -753,8 +717,6 @@ class DDPMTrainer:
                 loss = (
                             loss_diff
                             + weighted_phys
-                            + lambda_smooth_space * loss_smooth_space
-                            + lambda_smooth_time * loss_smooth_time
                         )
 
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -772,8 +734,6 @@ class DDPMTrainer:
             total_loss += float(loss.item()) * B
             total_diff_loss += float(loss_diff.item()) * B
             total_phys_loss += float(loss_phys.item()) * B
-            total_smooth_space_loss += float(loss_smooth_space.item()) * B
-            total_smooth_time_loss += float(loss_smooth_time.item()) * B
             n += B
 
             if (batch_idx + 1) % max(1, num_batches // 10) == 0 or (batch_idx + 1) % 10 == 0:
@@ -786,8 +746,6 @@ class DDPMTrainer:
                         f"Diff: {loss_diff.item():.6f} | "
                         f"WeightedPhys: {weighted_phys.item():.6f} | "
                         f"LambdaPhys: {lambda_phys_epoch:.2e} | "
-                        f"Space: {loss_smooth_space.item():.6f} | "
-                        f"TimeAccel: {loss_smooth_time.item():.6f} | "
                         #f"Avg Loss: {current_avg_loss:.6f} | "
                         f"Avg Diff: {current_avg_diff:.6f} | "
                         f"Avg Phys: {current_avg_phys:.6f}"
@@ -796,20 +754,14 @@ class DDPMTrainer:
         avg_loss = total_loss / max(n, 1)
         avg_diff_loss = total_diff_loss / max(n, 1)
         avg_phys_loss = total_phys_loss / max(n, 1)
-        avg_smooth_space_loss = total_smooth_space_loss / max(n, 1)
-        avg_smooth_time_loss = total_smooth_time_loss / max(n, 1)
         print(
             f"  Epoch {epoch} complete | Average Loss: {avg_loss:.6f} | "
-            f"Average Diff: {avg_diff_loss:.6f} | Average Phys: {avg_phys_loss:.6f} | "
-            f"Spatial nonsmoothness: {avg_smooth_space_loss:.6f} | "
-            f"Time acceleration: {avg_smooth_time_loss:.6f}"
+            f"Average Diff: {avg_diff_loss:.6f} | Average Phys: {avg_phys_loss:.6f}"
         )
         return (
             avg_loss,
             avg_diff_loss,
             avg_phys_loss,
-            avg_smooth_space_loss,
-            avg_smooth_time_loss,
         )
 
     @torch.no_grad()
@@ -888,7 +840,7 @@ def run_training(
         epochs=30,
         guidance_scale=1.0,
         use_amp=True,
-        dt_phys=0.001,
+        dt_phys=0.01,
     )
 
     train_loader = DataLoader(
@@ -944,8 +896,8 @@ def run_training(
 
         for epoch in range(1, cfg.epochs + 1):
             t0 = time.time()
-            train_loss, train_loss_data, train_loss_physics, train_loss_spatial_nonsmoothness, train_loss_time_acceleration = (
-                trainer.train_one_epoch(train_loader, epoch)
+            train_loss, train_loss_data, train_loss_physics = trainer.train_one_epoch(
+                train_loader, epoch
             )
 
             ckpt = {
@@ -968,15 +920,11 @@ def run_training(
             mlflow.log_metric("train_loss", float(train_loss), step=epoch)
             mlflow.log_metric("train_loss_data", float(train_loss_data), step=epoch)
             mlflow.log_metric("train_loss_physics", float(train_loss_physics), step=epoch)
-            mlflow.log_metric("train_loss_spatial_nonsmoothness", float(train_loss_spatial_nonsmoothness), step=epoch)
-            mlflow.log_metric("train_loss_time_acceleration", float(train_loss_time_acceleration), step=epoch)
             mlflow.log_metric("test_recon_mse", float(test_mse), step=epoch)
 
             print(
                 f"Epoch {epoch:03d} | train_loss={train_loss:.6f} "
-                f"(data={train_loss_data:.6f}, phys={train_loss_physics:.6f}, "
-                f"space={train_loss_spatial_nonsmoothness:.6f}, "
-                f"time_accel={train_loss_time_acceleration:.6f}) | "
+                f"(data={train_loss_data:.6f}, phys={train_loss_physics:.6f}) | "
                 f"test_recon_mse~={test_mse:.6f} | {dt:.1f}s"
             )
 
@@ -1190,8 +1138,8 @@ def run_training_resume(
         for i in range(1, additional_epochs + 1):
             log_step = start_step + i
             t0 = time.time()
-            train_loss, train_loss_data, train_loss_physics, train_loss_spatial_nonsmoothness, train_loss_time_acceleration = (
-                trainer.train_one_epoch(train_loader, i)
+            train_loss, train_loss_data, train_loss_physics = trainer.train_one_epoch(
+                train_loader, i
             )
 
             payload = {
@@ -1213,15 +1161,12 @@ def run_training_resume(
             mlflow.log_metric("train_loss", float(train_loss), step=log_step)
             mlflow.log_metric("train_loss_data", float(train_loss_data), step=log_step)
             mlflow.log_metric("train_loss_physics", float(train_loss_physics), step=log_step)
-            mlflow.log_metric("train_loss_spatial_nonsmoothness", float(train_loss_spatial_nonsmoothness), step=log_step)
-            mlflow.log_metric("train_loss_time_acceleration", float(train_loss_time_acceleration), step=log_step)
             mlflow.log_metric("test_recon_mse", float(test_mse), step=log_step)
 
             print(
                 f"Epoch (resume {i}/{additional_epochs}) global_step={log_step} | "
-                f"train_loss={train_loss:.6f} (data={train_loss_data:.6f}, phys={train_loss_physics:.6f}, "
-                f"space={train_loss_spatial_nonsmoothness:.6f}, "
-                f"time_accel={train_loss_time_acceleration:.6f}) | "
+                f"train_loss={train_loss:.6f} "
+                f"(data={train_loss_data:.6f}, phys={train_loss_physics:.6f}) | "
                 f"test_recon_mse~={test_mse:.6f} | {dt:.1f}s"
             )
 
