@@ -247,7 +247,7 @@ class DiffusionConfig:
     epochs: int = 30
     guidance_scale: float = 1.0
     use_amp: bool = True
-    lambda_phys_start: float = 1e-8
+    lambda_phys_start: float = 1e-13
     lambda_phys_max: float = 1e-5
     lambda_phys_warmup_ratio: float = 0.5
     physics_weight_cap: float = 5.0
@@ -643,12 +643,12 @@ def run_training(args: argparse.Namespace) -> None:
                 "scaler": trainer.scaler.state_dict(),
                 "best_test_recon_mse": best_test,
             }
-            torch.save(ckpt, out_dir / "conditional_velocity.pt")
+            torch.save(ckpt, out_dir / "conditional.pt")
 
             if epoch == 1 or test_mse < best_test:
                 best_test = test_mse
                 ckpt["best_test_recon_mse"] = best_test
-                torch.save(ckpt, out_dir / "best_velocity.pt")
+                torch.save(ckpt, out_dir / "best.pt")
 
             print(
                 f"Epoch {epoch:03d} | train_loss={metrics['loss']:.6e} "
@@ -660,9 +660,9 @@ def run_training(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train velocity PIDM for sparse 8x8 -> full 64x64 reconstruction.")
-    parser.add_argument("--velocity-x-dataset", type=Path, default=Path("Data/NSE_Velocity_X_64_centered_pde_dt0.001.npy"))
-    parser.add_argument("--velocity-y-dataset", type=Path, default=Path("Data/NSE_Velocity_Y_64_centered_pde_dt0.001.npy"))
-    parser.add_argument("--out-dir", type=Path, default=Path("Runs/VelocityPIDM"))
+    parser.add_argument("--velocity-x-dataset", type=Path, default=Path("/content/drive/MyDrive/Lab/CondDiff/NSE_Velocity_X.npy"))
+    parser.add_argument("--velocity-y-dataset", type=Path, default=Path("/content/drive/MyDrive/Lab/CondDiff/NSE_Velocity_Y.npy"))
+    parser.add_argument("--out-dir", type=Path, default=Path("/content/drive/MyDrive/Lab/CondDiff"))
     parser.add_argument("--mlflow-experiment", default="pidm_2dns_velocity")
     parser.add_argument("--mlflow-run-name", default="velocity_sparse_conditional_ddpm")
     parser.add_argument("--seed", type=int, default=0)
@@ -681,8 +681,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--eval-batches", type=int, default=2)
-    parser.add_argument("--lambda-phys-start", type=float, default=1e-8)
-    parser.add_argument("--lambda-phys-max", type=float, default=1e-5)
+    parser.add_argument("--lambda-phys-start", type=float, default=1e-15)
+    parser.add_argument("--lambda-phys-max", type=float, default=1e-10)
     parser.add_argument("--lambda-phys-warmup-ratio", type=float, default=0.5)
     parser.add_argument("--physics-weight-cap", type=float, default=5.0)
     parser.add_argument("--phys-t-max", type=int, default=100)
