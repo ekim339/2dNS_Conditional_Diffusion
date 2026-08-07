@@ -352,6 +352,9 @@ class DiffusionConfig:
     lambda_phys_start: float = 1e-14
     lambda_phys_max: float = 1e-10
     lambda_phys_warmup_ratio: float = 0.8
+    auto_scale_physics: bool = True
+    physics_scale_min: float = 0.0
+    physics_scale_max: float = 1.0
     dt_phys: float = 0.001
     viscosity: float = 1e-4
     # calc_nse_loss.py uses the full spectrum by default.
@@ -603,6 +606,8 @@ class DDPMTrainer:
         total_loss = 0.0
         total_diff_loss = 0.0
         total_phys_loss = 0.0
+        total_weighted_phys_loss = 0.0
+        total_phys_scale = 0.0
         total_smooth_space_loss = 0.0
         total_smooth_time_loss = 0.0
         n = 0
@@ -701,8 +706,17 @@ class DDPMTrainer:
                     warmup_ratio=self.cfg.lambda_phys_warmup_ratio,
                 )
 
-                weighted_phys_raw = lambda_phys_epoch * loss_phys
-                weighted_phys = torch.clamp(weighted_phys_raw, max=5.0)
+                if self.cfg.auto_scale_physics:
+                    physics_scale = (loss_diff.detach() / (loss_phys.detach() + 1e-12)).clamp(
+                        min=self.cfg.physics_scale_min,
+                        max=self.cfg.physics_scale_max,
+                    )
+                    weighted_phys_raw = physics_scale * loss_phys
+                    weighted_phys = weighted_phys_raw
+                else:
+                    physics_scale = loss_phys.new_tensor(lambda_phys_epoch)
+                    weighted_phys_raw = physics_scale * loss_phys
+                    weighted_phys = torch.clamp(weighted_phys_raw, max=5.0)
 
                 if loss_phys.item() > 1e8:
                     with torch.no_grad():
@@ -712,8 +726,12 @@ class DDPMTrainer:
 
                         print(f"loss_diff:        {loss_diff.item():.6e}")
                         print(f"loss_phys:        {loss_phys.item():.6e}")
+                        print(f"loss_phys scale:  {physics_scale.item():.6e}")
                         print(f"loss_phys weighted raw: {weighted_phys_raw.item():.6e}")
-                        print(f"loss_phys weighted cap: {weighted_phys.item():.6e}")
+                        if self.cfg.auto_scale_physics:
+                            print(f"loss_phys weighted: {weighted_phys.item():.6e}")
+                        else:
+                            print(f"loss_phys weighted cap: {weighted_phys.item():.6e}")
                         print(f"loss_smooth_space:{loss_smooth_space.item():.6e}")
                         print(f"loss_smooth_time: {loss_smooth_time.item():.6e}")
 
@@ -772,6 +790,8 @@ class DDPMTrainer:
             total_loss += float(loss.item()) * B
             total_diff_loss += float(loss_diff.item()) * B
             total_phys_loss += float(loss_phys.item()) * B
+            total_weighted_phys_loss += float(weighted_phys.item()) * B
+            total_phys_scale += float(physics_scale.item()) * B
             total_smooth_space_loss += float(loss_smooth_space.item()) * B
             total_smooth_time_loss += float(loss_smooth_time.item()) * B
             n += B
@@ -780,27 +800,33 @@ class DDPMTrainer:
                 current_avg_loss = total_loss / max(n, 1)
                 current_avg_diff = total_diff_loss / max(n, 1)
                 current_avg_phys = total_phys_loss / max(n, 1)
+                current_avg_weighted_phys = total_weighted_phys_loss / max(n, 1)
                 print(
                         f"    Batch {batch_idx + 1}/{num_batches} | "
                         f"Loss: {loss.item():.6f} | "
                         f"Diff: {loss_diff.item():.6f} | "
                         f"WeightedPhys: {weighted_phys.item():.6f} | "
-                        f"LambdaPhys: {lambda_phys_epoch:.2e} | "
+                        f"PhysScale: {physics_scale.item():.2e} | "
                         f"Space: {loss_smooth_space.item():.6f} | "
                         f"TimeAccel: {loss_smooth_time.item():.6f} | "
                         #f"Avg Loss: {current_avg_loss:.6f} | "
                         f"Avg Diff: {current_avg_diff:.6f} | "
-                        f"Avg Phys: {current_avg_phys:.6f}"
+                        f"Avg Phys: {current_avg_phys:.6f} | "
+                        f"Avg WeightedPhys: {current_avg_weighted_phys:.6f}"
                     )
 
         avg_loss = total_loss / max(n, 1)
         avg_diff_loss = total_diff_loss / max(n, 1)
         avg_phys_loss = total_phys_loss / max(n, 1)
+        avg_weighted_phys_loss = total_weighted_phys_loss / max(n, 1)
+        avg_phys_scale = total_phys_scale / max(n, 1)
         avg_smooth_space_loss = total_smooth_space_loss / max(n, 1)
         avg_smooth_time_loss = total_smooth_time_loss / max(n, 1)
         print(
             f"  Epoch {epoch} complete | Average Loss: {avg_loss:.6f} | "
             f"Average Diff: {avg_diff_loss:.6f} | Average Phys: {avg_phys_loss:.6f} | "
+            f"Average Weighted Phys: {avg_weighted_phys_loss:.6f} | "
+            f"Average Phys Scale: {avg_phys_scale:.6e} | "
             f"Spatial nonsmoothness: {avg_smooth_space_loss:.6f} | "
             f"Time acceleration: {avg_smooth_time_loss:.6f}"
         )
@@ -808,6 +834,8 @@ class DDPMTrainer:
             avg_loss,
             avg_diff_loss,
             avg_phys_loss,
+            avg_weighted_phys_loss,
+            avg_phys_scale,
             avg_smooth_space_loss,
             avg_smooth_time_loss,
         )
@@ -944,7 +972,7 @@ def run_training(
 
         for epoch in range(1, cfg.epochs + 1):
             t0 = time.time()
-            train_loss, train_loss_data, train_loss_physics, train_loss_spatial_nonsmoothness, train_loss_time_acceleration = (
+            train_loss, train_loss_data, train_loss_physics, train_loss_physics_weighted, train_loss_physics_scale, train_loss_spatial_nonsmoothness, train_loss_time_acceleration = (
                 trainer.train_one_epoch(train_loader, epoch)
             )
 
@@ -968,6 +996,8 @@ def run_training(
             mlflow.log_metric("train_loss", float(train_loss), step=epoch)
             mlflow.log_metric("train_loss_data", float(train_loss_data), step=epoch)
             mlflow.log_metric("train_loss_physics", float(train_loss_physics), step=epoch)
+            mlflow.log_metric("train_loss_physics_weighted", float(train_loss_physics_weighted), step=epoch)
+            mlflow.log_metric("train_loss_physics_scale", float(train_loss_physics_scale), step=epoch)
             mlflow.log_metric("train_loss_spatial_nonsmoothness", float(train_loss_spatial_nonsmoothness), step=epoch)
             mlflow.log_metric("train_loss_time_acceleration", float(train_loss_time_acceleration), step=epoch)
             mlflow.log_metric("test_recon_mse", float(test_mse), step=epoch)
@@ -975,6 +1005,8 @@ def run_training(
             print(
                 f"Epoch {epoch:03d} | train_loss={train_loss:.6f} "
                 f"(data={train_loss_data:.6f}, phys={train_loss_physics:.6f}, "
+                f"weighted_phys={train_loss_physics_weighted:.6f}, "
+                f"phys_scale={train_loss_physics_scale:.2e}, "
                 f"space={train_loss_spatial_nonsmoothness:.6f}, "
                 f"time_accel={train_loss_time_acceleration:.6f}) | "
                 f"test_recon_mse~={test_mse:.6f} | {dt:.1f}s"
@@ -1190,7 +1222,7 @@ def run_training_resume(
         for i in range(1, additional_epochs + 1):
             log_step = start_step + i
             t0 = time.time()
-            train_loss, train_loss_data, train_loss_physics, train_loss_spatial_nonsmoothness, train_loss_time_acceleration = (
+            train_loss, train_loss_data, train_loss_physics, train_loss_physics_weighted, train_loss_physics_scale, train_loss_spatial_nonsmoothness, train_loss_time_acceleration = (
                 trainer.train_one_epoch(train_loader, i)
             )
 
@@ -1213,6 +1245,8 @@ def run_training_resume(
             mlflow.log_metric("train_loss", float(train_loss), step=log_step)
             mlflow.log_metric("train_loss_data", float(train_loss_data), step=log_step)
             mlflow.log_metric("train_loss_physics", float(train_loss_physics), step=log_step)
+            mlflow.log_metric("train_loss_physics_weighted", float(train_loss_physics_weighted), step=log_step)
+            mlflow.log_metric("train_loss_physics_scale", float(train_loss_physics_scale), step=log_step)
             mlflow.log_metric("train_loss_spatial_nonsmoothness", float(train_loss_spatial_nonsmoothness), step=log_step)
             mlflow.log_metric("train_loss_time_acceleration", float(train_loss_time_acceleration), step=log_step)
             mlflow.log_metric("test_recon_mse", float(test_mse), step=log_step)
@@ -1220,6 +1254,8 @@ def run_training_resume(
             print(
                 f"Epoch (resume {i}/{additional_epochs}) global_step={log_step} | "
                 f"train_loss={train_loss:.6f} (data={train_loss_data:.6f}, phys={train_loss_physics:.6f}, "
+                f"weighted_phys={train_loss_physics_weighted:.6f}, "
+                f"phys_scale={train_loss_physics_scale:.2e}, "
                 f"space={train_loss_spatial_nonsmoothness:.6f}, "
                 f"time_accel={train_loss_time_acceleration:.6f}) | "
                 f"test_recon_mse~={test_mse:.6f} | {dt:.1f}s"
