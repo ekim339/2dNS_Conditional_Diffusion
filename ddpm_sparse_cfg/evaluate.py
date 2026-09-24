@@ -620,8 +620,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data",
         default=(
-            "/Users/eugenekim/AIMS Lab/Controlling-Kolmogorov-Flow/"
-            "kolmogorov_Re_250_vorticity.npy"
+            "/content/drive/MyDrive/Lab/CondDiff/kolmogorov_Re_250_vorticity.npy"
         ),
         help="Real physical-space vorticity array with shape (N,64,64)",
     )
