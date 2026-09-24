@@ -271,8 +271,8 @@ def compare_train_and_test_samples(
 
 if __name__ == "__main__":
     #Configuration
-    ckpt_path = "/Users/eugenekim/2dNS_Conditional_Diffusion/checkpoint/best (1).pt"
-    data_path = "/Users/eugenekim/2dNS_Conditional_Diffusion/NSE_Data(Noisy).npy"
+    ckpt_path = "/Users/eugenekim/2dNS_Conditional_Diffusion/checkpoint/best.pt"
+    data_path = "/Users/eugenekim/AIMS Lab/Discrete-CGKN/NSE/Data/new/Kolmogorov_Vorticity_64.npy"
     guidance_scale = None  # None = use checkpoint's guidance_scale, or set explicitly (e.g., 4.0)
     
     compare_train_and_test_samples(

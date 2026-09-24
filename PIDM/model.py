@@ -9,8 +9,9 @@
 # - Splits first 80% train, last 20% test.
 # - Sparse 8x8 observations on a fixed grid (stride=8) + binary mask condition.
 # - Trains conditional DDPM with optional CFG dropout.
-# - Physics loss: predict vorticity at k-1, k, k+1 and penalize the 2D NS
-#   vorticity residual (central time derivative + spectral advection/diffusion).
+# - Physics loss: predict vorticity at k-2, ..., k+2 and penalize the exact
+#   residual used by evaluate_continuous_2dns_kolmogorov.py (a fourth-order
+#   centered time derivative plus the repository pseudo-spectral RHS).
 #
 # Notes:
 # - U-Net input: cat([x_t, sparse_field, mask], dim=1) -> 3 channels.
@@ -80,25 +81,48 @@ def extract(a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tens
     return out
 
 
-def physics_mlflow_params(grid_size: int = 64, dt_phys: float = 0.001) -> Dict[str, str]:
-  """Hardcoded PDE domain/forcing settings for MLflow (must match pde_residual)."""
-  dx = 1.0 / grid_size
-  grid_extent = (grid_size - 1) / grid_size
-  return {
-      "physics_domain": "[0,1]^2 periodic",
-      "physics_grid_size": str(grid_size),
-      "physics_dx": str(dx),
-      "physics_dy": str(dx),
-      "physics_grid_extent": str(grid_extent),
-      "physics_dt_phys": str(dt_phys),
-      "physics_derivative_convention": "simulator FFT-index units",
-      "physics_forcing": "sampled f=[100*sin(8*pi*y), 0]^T",
-      "physics_forcing_curl_z": "spectral curl of sampled force",
-  }
+def physics_mlflow_params(
+    grid_size: int = 64,
+    dt_phys: float = 0.001,
+    reynolds_number: float = 250.0,
+    viscosity: float = 0.004,
+    forcing_wavenumber: int = 4,
+) -> Dict[str, str]:
+    """PDE settings matching evaluate_continuous_2dns_kolmogorov.py."""
+    domain_length = 2.0 * math.pi
+    return {
+        "physics_residual": "domega_dt - repository_pseudospectral_rhs",
+        "physics_domain": "[0,2*pi]^2 periodic",
+        "physics_grid_size": str(grid_size),
+        "physics_fft_dx": str(domain_length / grid_size),
+        "physics_forcing_grid_spacing": str(domain_length / (grid_size - 1)),
+        "physics_dt_phys": str(dt_phys),
+        "physics_time_derivative": "5-point 4th-order centered",
+        "physics_reynolds_number": str(reynolds_number),
+        "physics_viscosity": str(viscosity),
+        "physics_forcing": f"f=[sin({forcing_wavenumber}*y), 0]^T",
+        "physics_forcing_wavenumber": str(forcing_wavenumber),
+        "physics_forcing_curl_z": "repository spectral curl",
+        "physics_spatial_operator": "Controlling-Kolmogorov-Flow pseudo-spectral RHS",
+    }
 
 
-def log_physics_mlflow_params(grid_size: int = 64, dt_phys: float = 0.001) -> None:
-    mlflow.log_params(physics_mlflow_params(grid_size, dt_phys))
+def log_physics_mlflow_params(
+    grid_size: int = 64,
+    dt_phys: float = 0.001,
+    reynolds_number: float = 250.0,
+    viscosity: float = 0.004,
+    forcing_wavenumber: int = 4,
+) -> None:
+    mlflow.log_params(
+        physics_mlflow_params(
+            grid_size=grid_size,
+            dt_phys=dt_phys,
+            reynolds_number=reynolds_number,
+            viscosity=viscosity,
+            forcing_wavenumber=forcing_wavenumber,
+        )
+    )
 
 
 # -------------------------
@@ -116,7 +140,10 @@ class NavierStokesSparseDataset(Dataset):
         sensor_stride=8 on a 64x64 grid gives an 8x8 observation lattice
         (i.e. 64 observed points total).
 
-        Returns consecutive triplets (k-1, k, k+1) for PIDM physics loss.
+        Returns five consecutive frames (k-2, ..., k+2) for the fourth-order
+        physics-loss time stencil. The two frames on each side are stacked so
+        the public batch remains a six-tensor tuple:
+        (omega_before, x0, omega_after, cond_before, cond, cond_after).
         """
         assert full_fields.ndim == 3 and full_fields.shape[1:] == (64, 64)
         self.x = full_fields.float()
@@ -125,8 +152,8 @@ class NavierStokesSparseDataset(Dataset):
         self.sensor_stride = int(sensor_stride)
 
     def __len__(self):
-        # centers k must have both temporal neighbors
-        return max(0, self.x.shape[0] - 2)
+        # Centers k must have two temporal neighbors on each side.
+        return max(0, self.x.shape[0] - 4)
 
     def _normalize(self, field: torch.Tensor) -> torch.Tensor:
         return (field - self.mean) / (self.std + 1e-8)
@@ -138,22 +165,30 @@ class NavierStokesSparseDataset(Dataset):
         return torch.stack([y_sparse, mask], dim=0)  # (2, 64, 64)
 
     def __getitem__(self, idx: int):
-        k = idx + 1
-        x_prev = self._normalize(self.x[k - 1])
+        k = idx + 2
+        x_minus_2 = self._normalize(self.x[k - 2])
+        x_minus_1 = self._normalize(self.x[k - 1])
         x0 = self._normalize(self.x[k])
-        x_next = self._normalize(self.x[k + 1])
+        x_plus_1 = self._normalize(self.x[k + 1])
+        x_plus_2 = self._normalize(self.x[k + 2])
 
-        cond_prev = self._sparse_cond(x_prev)
+        omega_before = torch.stack([x_minus_2, x_minus_1], dim=0).unsqueeze(1)
+        omega_after = torch.stack([x_plus_1, x_plus_2], dim=0).unsqueeze(1)
+        cond_before = torch.stack(
+            [self._sparse_cond(x_minus_2), self._sparse_cond(x_minus_1)], dim=0
+        )
         cond = self._sparse_cond(x0)
-        cond_next = self._sparse_cond(x_next)
+        cond_after = torch.stack(
+            [self._sparse_cond(x_plus_1), self._sparse_cond(x_plus_2)], dim=0
+        )
 
         return (
-            x_prev.unsqueeze(0),
+            omega_before,
             x0.unsqueeze(0),
-            x_next.unsqueeze(0),
-            cond_prev,
+            omega_after,
+            cond_before,
             cond,
-            cond_next,
+            cond_after,
         )
 
 # -------------------------
@@ -356,8 +391,11 @@ class DiffusionConfig:
     physics_scale_min: float = 0.0
     physics_scale_max: float = 1.0
     dt_phys: float = 0.001
-    viscosity: float = 1e-4
-    # calc_nse_loss.py uses the full spectrum by default.
+    reynolds_number: float = 250.0
+    viscosity: float = 0.004
+    forcing_wavenumber: int = 4
+    # Retained for old checkpoint compatibility; the exact repository RHS does
+    # not apply this optional filter.
     low_freq_k_cutoff: Optional[float] = None
 
 
@@ -376,6 +414,18 @@ class DDPMTrainer:
         self.data_mean = float(data_mean)
         self.data_std = float(data_std)
         self.dt = cfg.dt_phys
+
+        if cfg.reynolds_number <= 0:
+            raise ValueError("reynolds_number must be positive")
+        expected_viscosity = 1.0 / cfg.reynolds_number
+        if not math.isclose(
+            cfg.viscosity, expected_viscosity, rel_tol=1e-7, abs_tol=1e-12
+        ):
+            raise ValueError(
+                "viscosity must equal 1 / reynolds_number for the referenced "
+                f"solver; got viscosity={cfg.viscosity} and "
+                f"reynolds_number={cfg.reynolds_number}"
+            )
 
         betas = make_beta_schedule(cfg.T, cfg.beta_schedule).to(device)
         alphas = 1.0 - betas
@@ -399,107 +449,116 @@ class DDPMTrainer:
                extract(self.sqrt_one_minus_alphas_cumprod, t, x0.shape) * noise
 
     @staticmethod
-    def _nse_wavenumbers(
+    def _repository_wavenumbers(
         nx: int,
         ny: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        kx_1d = torch.fft.fftfreq(nx, d=1.0 / nx, device=device)
-        ky_1d = torch.fft.fftfreq(ny, d=1.0 / ny, device=device)
+        """Fourier mesh produced by FlowConfig.create_fft_mesh()."""
+        domain_length = 2.0 * math.pi
+        kx_1d = torch.fft.fftfreq(nx, d=domain_length / nx, device=device)
+        ky_1d = torch.fft.rfftfreq(ny, d=domain_length / ny, device=device)
         kx = kx_1d.to(dtype).reshape(1, nx, 1)
-        ky = ky_1d.to(dtype).reshape(1, 1, ny)
-        k2 = kx**2 + ky**2
-        k2[:, 0, 0] = 1.0
-        return kx, ky, k2
+        ky = ky_1d.to(dtype).reshape(1, 1, ny // 2 + 1)
+        double_derivative = -(2.0 * math.pi) ** 2 * (kx.square() + ky.square())
+        return kx, ky, double_derivative
 
-    def _nse_gradient(self, field: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        kx, ky, _ = self._nse_wavenumbers(
-            field.shape[1],
-            field.shape[2],
-            field.device,
-            field.dtype,
-        )
-        field_hat = torch.fft.fft2(field)
-        field_x = torch.fft.ifft2(1j * kx * field_hat).real
-        field_y = torch.fft.ifft2(1j * ky * field_hat).real
-        return field_x, field_y
-
-    def _nse_laplacian(self, field: torch.Tensor) -> torch.Tensor:
-        _, _, k2 = self._nse_wavenumbers(
-            field.shape[1],
-            field.shape[2],
-            field.device,
-            field.dtype,
-        )
-        field_hat = torch.fft.fft2(field)
-        return torch.fft.ifft2(-k2 * field_hat).real
-
-    def _nse_velocity_from_vorticity(self, omega: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        kx, ky, k2 = self._nse_wavenumbers(
-            omega.shape[1],
-            omega.shape[2],
-            omega.device,
-            omega.dtype,
-        )
-        omega_hat = torch.fft.fft2(omega)
-        psi_hat = omega_hat / k2
-        psi_hat[:, 0, 0] = 0.0
-        velocity_x = torch.fft.ifft2(1j * ky * psi_hat).real
-        velocity_y = torch.fft.ifft2(-1j * kx * psi_hat).real
-        return velocity_x, velocity_y
-
-    def _nse_curl_forcing(
+    def _repository_forcing_hat(
         self,
-        batch_size: int,
         nx: int,
         ny: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        grid_extent = (ny - 1) / ny
-        y = grid_extent * torch.arange(ny, device=device, dtype=dtype) / (ny - 1)
-        force_x = 100.0 * torch.sin(8.0 * math.pi * y)
-        force_x = force_x.reshape(1, 1, ny).expand(batch_size, nx, ny)
-        _, force_x_y = self._nse_gradient(force_x)
-        return -force_x_y
+        """Vorticity forcing returned by PseudoSpectralNavierStokes2D."""
+        x = torch.linspace(0.0, 2.0 * math.pi, nx, device=device, dtype=dtype)
+        y = torch.linspace(0.0, 2.0 * math.pi, ny, device=device, dtype=dtype)
+        _, y_grid = torch.meshgrid(x, y, indexing="ij")
+        force_x = torch.sin(self.cfg.forcing_wavenumber * y_grid)
+        force_y = torch.zeros_like(force_x)
+
+        force_x_hat = torch.fft.rfft2(force_x)
+        force_y_hat = torch.fft.rfft2(force_y)
+        kx, ky, _ = self._repository_wavenumbers(nx, ny, device, dtype)
+        return (2j * math.pi) * (
+            force_y_hat.unsqueeze(0) * kx - force_x_hat.unsqueeze(0) * ky
+        )
+
+    def _repository_rhs(self, omega: torch.Tensor) -> torch.Tensor:
+        """Differentiable PyTorch port of the evaluator's repository RHS."""
+        batch_size, nx, ny = omega.shape
+        kx, ky, double_derivative = self._repository_wavenumbers(
+            nx, ny, omega.device, omega.dtype
+        )
+        omega_hat = torch.fft.rfft2(omega)
+
+        safe_double_derivative = double_derivative.clone()
+        safe_double_derivative[:, 0, 0] = 1.0
+        psi_hat = -omega_hat / safe_double_derivative
+        velocity_x_hat = (2j * math.pi) * ky * psi_hat
+        velocity_y_hat = (-2j * math.pi) * kx * psi_hat
+        velocity_x = torch.fft.irfft2(velocity_x_hat, s=(nx, ny))
+        velocity_y = torch.fft.irfft2(velocity_y_hat, s=(nx, ny))
+
+        grad_x = torch.fft.irfft2((2j * math.pi) * kx * omega_hat, s=(nx, ny))
+        grad_y = torch.fft.irfft2((2j * math.pi) * ky * omega_hat, s=(nx, ny))
+        advection_hat = torch.fft.rfft2(-(grad_x * velocity_x + grad_y * velocity_y))
+
+        # equations.utils.dealiasing() in the referenced repository currently
+        # returns its input unchanged (its JAX .at[].set results are not
+        # rebound), so exact evaluator parity requires no mask here.
+        forcing_hat = self._repository_forcing_hat(nx, ny, omega.device, omega.dtype)
+        diffusion_hat = self.cfg.viscosity * double_derivative * omega_hat
+        rhs_hat = advection_hat + forcing_hat.expand(batch_size, -1, -1) + diffusion_hat
+        return torch.fft.irfft2(rhs_hat, s=(nx, ny))
 
     def pde_residual(
         self,
+        omega_k_minus_2: torch.Tensor,
         omega_k_minus_1: torch.Tensor,
         omega_k: torch.Tensor,
         omega_k_plus_1: torch.Tensor,
+        omega_k_plus_2: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Same centered PDE residual as NSE/calc_nse_loss.py:
-            dω/dt + u * dω/dx + v * dω/dy - ν * ∇²ω - (curl f)_z
+        Exact residual from evaluate_continuous_2dns_kolmogorov.py:
 
-        Alignment details:
-        - FFT-index derivatives, not 2*pi-scaled physical derivatives.
-        - Full-spectrum fft2 derivatives by default.
-        - curl(f) is the spectral curl of the sampled force array
-          f_x = 100*sin(8*pi*y), not an analytic cosine formula.
-        - y-grid is 0, 1/64, ..., 63/64 as in NSE_Simulation_64.jl.
+            R = dω/dt - PseudoSpectralNavierStokes2D_RHS(ω_k)
+
+        dω/dt uses the evaluator's default five-point, fourth-order centered
+        stencil. Spatial terms use the same rfft2/irfft2 mesh, stream-function
+        velocity, nonlinear product, forcing construction, and diffusion.
         """
-        dt = self.dt
-        nu = self.cfg.viscosity
+        fields = (
+            omega_k_minus_2,
+            omega_k_minus_1,
+            omega_k,
+            omega_k_plus_1,
+            omega_k_plus_2,
+        )
+        if any(field.ndim != 4 or field.shape[1] != 1 for field in fields):
+            shapes = [tuple(field.shape) for field in fields]
+            raise ValueError(f"Expected five (B,1,H,W) vorticity tensors, got {shapes}")
 
-        w_prev = omega_k_minus_1.squeeze(1)
-        w_cur = omega_k.squeeze(1)
-        w_next = omega_k_plus_1.squeeze(1)
+        w_minus_2, w_minus_1, w_cur, w_plus_1, w_plus_2 = (
+            field.squeeze(1) for field in fields
+        )
 
-        B, H, W = w_cur.shape
+        _, H, W = w_cur.shape
         if H != 64 or W != 64:
             raise ValueError(f"Expected 64x64 vorticity fields, got {H}x{W}")
+        if any(
+            field.shape != w_cur.shape
+            for field in (w_minus_2, w_minus_1, w_plus_1, w_plus_2)
+        ):
+            raise ValueError("All five vorticity fields must have the same shape")
 
-        w_t = (w_next - w_prev) / (2.0 * dt)
-        u, v = self._nse_velocity_from_vorticity(w_cur)
-        w_x, w_y = self._nse_gradient(w_cur)
-        lap_w = self._nse_laplacian(w_cur)
-        forcing_vort = self._nse_curl_forcing(B, H, W, w_cur.device, w_cur.dtype)
-
-        R = w_t + u * w_x + v * w_y - nu * lap_w - forcing_vort
-        return R.unsqueeze(1)
+        d_omega_dt = (
+            w_minus_2 - 8.0 * w_minus_1 + 8.0 * w_plus_1 - w_plus_2
+        ) / (12.0 * self.dt)
+        residual = d_omega_dt - self._repository_rhs(w_cur)
+        return residual.unsqueeze(1)
 
     def p_mean_variance(self, x_t: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -617,13 +676,29 @@ class DDPMTrainer:
 
         print(f"  Starting epoch {epoch} ({num_batches} batches)...")
 
-        for batch_idx, (omega_prev, x0, omega_next, cond_prev, cond, cond_next) in enumerate(loader):
-            omega_prev = omega_prev.to(self.device)
+        for batch_idx, (
+            omega_before,
+            x0,
+            omega_after,
+            cond_before,
+            cond,
+            cond_after,
+        ) in enumerate(loader):
+            omega_before = omega_before.to(self.device)
             x0 = x0.to(self.device)
-            omega_next = omega_next.to(self.device)
-            cond_prev = cond_prev.to(self.device)
+            omega_after = omega_after.to(self.device)
+            cond_before = cond_before.to(self.device)
             cond = cond.to(self.device)
-            cond_next = cond_next.to(self.device)
+            cond_after = cond_after.to(self.device)
+
+            omega_minus_2 = omega_before[:, 0]
+            omega_minus_1 = omega_before[:, 1]
+            omega_plus_1 = omega_after[:, 0]
+            omega_plus_2 = omega_after[:, 1]
+            cond_minus_2 = cond_before[:, 0]
+            cond_minus_1 = cond_before[:, 1]
+            cond_plus_1 = cond_after[:, 0]
+            cond_plus_2 = cond_after[:, 1]
 
             B = x0.size(0)
             t = torch.randint(0, self.cfg.T, (B,), device=self.device, dtype=torch.long)
@@ -666,31 +741,42 @@ class DDPMTrainer:
                     eps_pred_center = self.model(x_t[idx_phys], t_p, cond[idx_phys])
                     x0_pred = (x_t[idx_phys] - sqrt_om * eps_pred_center) / (sqrt_acp + 1e-8)
 
-                    noise_prev = torch.randn_like(omega_prev[idx_phys])
-                    noise_next = torch.randn_like(omega_next[idx_phys])
+                    def predict_clean_neighbor(field, field_cond):
+                        neighbor_noise = torch.randn_like(field[idx_phys])
+                        neighbor_noisy = self.q_sample(field[idx_phys], t_p, neighbor_noise)
+                        neighbor_eps = self.model(neighbor_noisy, t_p, field_cond[idx_phys])
+                        return (neighbor_noisy - sqrt_om * neighbor_eps) / (
+                            sqrt_acp + 1e-8
+                        )
 
-                    x_t_prev = self.q_sample(omega_prev[idx_phys], t_p, noise_prev)
-                    x_t_next = self.q_sample(omega_next[idx_phys], t_p, noise_next)
-
-                    eps_pred_prev = self.model(x_t_prev, t_p, cond_prev[idx_phys])
-                    eps_pred_next = self.model(x_t_next, t_p, cond_next[idx_phys])
-
-                    x_prev_pred = (x_t_prev - sqrt_om * eps_pred_prev) / (sqrt_acp + 1e-8)
-                    x_next_pred = (x_t_next - sqrt_om * eps_pred_next) / (sqrt_acp + 1e-8)
+                    x_minus_2_pred = predict_clean_neighbor(omega_minus_2, cond_minus_2)
+                    x_minus_1_pred = predict_clean_neighbor(omega_minus_1, cond_minus_1)
+                    x_plus_1_pred = predict_clean_neighbor(omega_plus_1, cond_plus_1)
+                    x_plus_2_pred = predict_clean_neighbor(omega_plus_2, cond_plus_2)
 
                     scale = self.data_std + 1e-8
                     x0_phys = x0_pred * scale + self.data_mean
-                    omega_prev_phys = x_prev_pred * scale + self.data_mean
-                    omega_next_phys = x_next_pred * scale + self.data_mean
+                    omega_minus_2_phys = x_minus_2_pred * scale + self.data_mean
+                    omega_minus_1_phys = x_minus_1_pred * scale + self.data_mean
+                    omega_plus_1_phys = x_plus_1_pred * scale + self.data_mean
+                    omega_plus_2_phys = x_plus_2_pred * scale + self.data_mean
 
                     loss_smooth_space = self.spatial_smoothness_loss(x0_phys)
                     loss_smooth_time = self.temporal_second_difference_loss(
-                        omega_prev_phys,
+                        omega_minus_1_phys,
                         x0_phys,
-                        omega_next_phys,
+                        omega_plus_1_phys,
                     )
 
-                    residual = self.pde_residual(omega_prev_phys, x0_phys, omega_next_phys)
+                    # FFT operations stay in float32 even when network inference
+                    # above uses AMP, matching the evaluator's spatial precision.
+                    residual = self.pde_residual(
+                        omega_minus_2_phys.float(),
+                        omega_minus_1_phys.float(),
+                        x0_phys.float(),
+                        omega_plus_1_phys.float(),
+                        omega_plus_2_phys.float(),
+                    )
                     loss_phys = F.mse_loss(residual, torch.zeros_like(residual))
                 else:
                     loss_phys = torch.tensor(0.0, device=x_t.device)
@@ -741,9 +827,11 @@ class DDPMTrainer:
 
                         print("\nPrediction field stats:")
                         for name, w in [
-                            ("omega_prev_phys", omega_prev_phys),
+                            ("omega_minus_2_phys", omega_minus_2_phys),
+                            ("omega_minus_1_phys", omega_minus_1_phys),
                             ("x0_phys", x0_phys),
-                             ("omega_next_phys", omega_next_phys),
+                            ("omega_plus_1_phys", omega_plus_1_phys),
+                            ("omega_plus_2_phys", omega_plus_2_phys),
                         ]:
                             print(
                                 f"  {name}: "
@@ -755,9 +843,9 @@ class DDPMTrainer:
                             )
 
                         print("\nTemporal jump stats:")
-                        dt_prev = x0_phys - omega_prev_phys
-                        dt_next = omega_next_phys - x0_phys
-                        dtt = omega_next_phys - 2.0 * x0_phys + omega_prev_phys
+                        dt_prev = x0_phys - omega_minus_1_phys
+                        dt_next = omega_plus_1_phys - x0_phys
+                        dtt = omega_plus_1_phys - 2.0 * x0_phys + omega_minus_1_phys
 
                         print(f"  |x0 - prev| mean: {dt_prev.abs().mean().item():.6e}")
                         print(f"  |x0 - prev| max:  {dt_prev.abs().max().item():.6e}")
@@ -917,6 +1005,9 @@ def run_training(
         guidance_scale=1.0,
         use_amp=True,
         dt_phys=0.001,
+        reynolds_number=250.0,
+        viscosity=0.004,
+        forcing_wavenumber=4,
     )
 
     train_loader = DataLoader(
@@ -966,7 +1057,13 @@ def run_training(
         mlflow.log_param("seed", seed)
         mlflow.log_param("train_mean", train_mean)
         mlflow.log_param("train_std", train_std)
-        log_physics_mlflow_params(grid_size=64, dt_phys=cfg.dt_phys)
+        log_physics_mlflow_params(
+            grid_size=64,
+            dt_phys=cfg.dt_phys,
+            reynolds_number=cfg.reynolds_number,
+            viscosity=cfg.viscosity,
+            forcing_wavenumber=cfg.forcing_wavenumber,
+        )
 
         best_test = float("inf")
 
@@ -1217,7 +1314,13 @@ def run_training_resume(
             mlflow.log_param("train_mean", train_mean)
             mlflow.log_param("train_std", train_std)
             mlflow.log_param("additional_epochs", additional_epochs)
-            log_physics_mlflow_params(grid_size=64, dt_phys=cfg.dt_phys)
+            log_physics_mlflow_params(
+                grid_size=64,
+                dt_phys=cfg.dt_phys,
+                reynolds_number=cfg.reynolds_number,
+                viscosity=cfg.viscosity,
+                forcing_wavenumber=cfg.forcing_wavenumber,
+            )
 
         for i in range(1, additional_epochs + 1):
             log_step = start_step + i
