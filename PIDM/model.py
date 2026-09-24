@@ -388,8 +388,8 @@ class DiffusionConfig:
     lambda_phys_max: float = 1e-10
     lambda_phys_warmup_ratio: float = 0.8
     auto_scale_physics: bool = True
-    physics_scale_min: float = 0.0
-    physics_scale_max: float = 1.0
+    physics_loss_target_ratio: float = 1.0
+    physics_scale_epsilon: float = 1e-12
     dt_phys: float = 0.001
     reynolds_number: float = 250.0
     viscosity: float = 0.004
@@ -415,6 +415,10 @@ class DDPMTrainer:
         self.data_std = float(data_std)
         self.dt = cfg.dt_phys
 
+        if cfg.physics_loss_target_ratio < 0:
+            raise ValueError("physics_loss_target_ratio must be nonnegative")
+        if cfg.physics_scale_epsilon <= 0:
+            raise ValueError("physics_scale_epsilon must be positive")
         if cfg.reynolds_number <= 0:
             raise ValueError("reynolds_number must be positive")
         expected_viscosity = 1.0 / cfg.reynolds_number
@@ -660,6 +664,32 @@ class DDPMTrainer:
 
         return lambda_start + ramp * (lambda_max - lambda_start)
 
+    @staticmethod
+    def scale_physics_loss_to_data(
+        loss_diff: torch.Tensor,
+        loss_phys: torch.Tensor,
+        target_ratio: float = 1.0,
+        epsilon: float = 1e-12,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Scale physics loss to a target value ratio relative to data loss.
+
+        The scale is detached so optimization cannot reduce the total loss by
+        manipulating the weight itself. With ``target_ratio=1``, the weighted
+        physics loss has the same scalar magnitude as the diffusion/data loss,
+        up to ``epsilon`` when the raw physics loss is extremely small.
+        """
+        if target_ratio < 0:
+            raise ValueError("target_ratio must be nonnegative")
+        if epsilon <= 0:
+            raise ValueError("epsilon must be positive")
+
+        physics_scale = (
+            target_ratio
+            * loss_diff.detach()
+            / loss_phys.detach().clamp_min(epsilon)
+        )
+        return physics_scale, physics_scale * loss_phys
+
     def train_one_epoch(self, loader: DataLoader, epoch: int):
         self.model.train()
         total_loss = 0.0
@@ -793,12 +823,19 @@ class DDPMTrainer:
                 )
 
                 if self.cfg.auto_scale_physics:
-                    physics_scale = (loss_diff.detach() / (loss_phys.detach() + 1e-12)).clamp(
-                        min=self.cfg.physics_scale_min,
-                        max=self.cfg.physics_scale_max,
-                    )
-                    weighted_phys_raw = physics_scale * loss_phys
-                    weighted_phys = weighted_phys_raw
+                    if idx_phys.numel() > 0:
+                        physics_scale, weighted_phys = (
+                            self.scale_physics_loss_to_data(
+                                loss_diff,
+                                loss_phys,
+                                target_ratio=self.cfg.physics_loss_target_ratio,
+                                epsilon=self.cfg.physics_scale_epsilon,
+                            )
+                        )
+                    else:
+                        physics_scale = loss_phys.new_zeros(())
+                        weighted_phys = loss_phys
+                    weighted_phys_raw = weighted_phys
                 else:
                     physics_scale = loss_phys.new_tensor(lambda_phys_epoch)
                     weighted_phys_raw = physics_scale * loss_phys
