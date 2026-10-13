@@ -329,7 +329,7 @@ class DiffusionConfig:
     guidance_scale: float = 1.0  # CFG sampling scale
     use_amp: bool = True
     dt_phys: float = 1e-3
-    viscosity: float = 1e-3
+    viscosity: float = 0.004
     low_freq_k_cutoff: Optional[float] = 2.0
 
 

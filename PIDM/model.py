@@ -33,6 +33,15 @@ import mlflow
 from mlflow.tracking import MlflowClient
 
 
+# Physics configuration used by kolmogorov_demo.ipynb. Keep these values in
+# one place so legacy cfgConditional checkpoints cannot silently restore an
+# incompatible PDE configuration when training is extended with physics loss.
+KOLMOGOROV_DT_PHYS = 0.001
+KOLMOGOROV_REYNOLDS_NUMBER = 250.0
+KOLMOGOROV_VISCOSITY = 1.0 / KOLMOGOROV_REYNOLDS_NUMBER
+KOLMOGOROV_FORCING_WAVENUMBER = 4
+
+
 # -------------------------
 # Utilities
 # -------------------------
@@ -83,10 +92,10 @@ def extract(a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tens
 
 def physics_mlflow_params(
     grid_size: int = 64,
-    dt_phys: float = 0.001,
-    reynolds_number: float = 250.0,
-    viscosity: float = 0.004,
-    forcing_wavenumber: int = 4,
+    dt_phys: float = KOLMOGOROV_DT_PHYS,
+    reynolds_number: float = KOLMOGOROV_REYNOLDS_NUMBER,
+    viscosity: float = KOLMOGOROV_VISCOSITY,
+    forcing_wavenumber: int = KOLMOGOROV_FORCING_WAVENUMBER,
 ) -> Dict[str, str]:
     """PDE settings matching evaluate_continuous_2dns_kolmogorov.py."""
     domain_length = 2.0 * math.pi
@@ -109,10 +118,10 @@ def physics_mlflow_params(
 
 def log_physics_mlflow_params(
     grid_size: int = 64,
-    dt_phys: float = 0.001,
-    reynolds_number: float = 250.0,
-    viscosity: float = 0.004,
-    forcing_wavenumber: int = 4,
+    dt_phys: float = KOLMOGOROV_DT_PHYS,
+    reynolds_number: float = KOLMOGOROV_REYNOLDS_NUMBER,
+    viscosity: float = KOLMOGOROV_VISCOSITY,
+    forcing_wavenumber: int = KOLMOGOROV_FORCING_WAVENUMBER,
 ) -> None:
     mlflow.log_params(
         physics_mlflow_params(
@@ -390,10 +399,10 @@ class DiffusionConfig:
     auto_scale_physics: bool = True
     physics_loss_target_ratio: float = 1.0
     physics_scale_epsilon: float = 1e-12
-    dt_phys: float = 0.001
-    reynolds_number: float = 250.0
-    viscosity: float = 0.004
-    forcing_wavenumber: int = 4
+    dt_phys: float = KOLMOGOROV_DT_PHYS
+    reynolds_number: float = KOLMOGOROV_REYNOLDS_NUMBER
+    viscosity: float = KOLMOGOROV_VISCOSITY
+    forcing_wavenumber: int = KOLMOGOROV_FORCING_WAVENUMBER
     # Retained for old checkpoint compatibility; the exact repository RHS does
     # not apply this optional filter.
     low_freq_k_cutoff: Optional[float] = None
@@ -1219,8 +1228,57 @@ def run_training(
 
 
 def _diffusion_config_from_ckpt(cfg_dict: Dict[str, Any]) -> DiffusionConfig:
+    if not isinstance(cfg_dict, dict):
+        raise TypeError(f"Checkpoint cfg must be a dictionary, got {type(cfg_dict).__name__}")
     fields = set(DiffusionConfig.__dataclass_fields__.keys())
     return DiffusionConfig(**{k: v for k, v in cfg_dict.items() if k in fields})
+
+
+def _cfgconditional_resume_config(
+    cfg_dict: Dict[str, Any],
+    additional_epochs: int,
+    dt_phys: float = KOLMOGOROV_DT_PHYS,
+    reynolds_number: float = KOLMOGOROV_REYNOLDS_NUMBER,
+    viscosity: float = KOLMOGOROV_VISCOSITY,
+    forcing_wavenumber: int = KOLMOGOROV_FORCING_WAVENUMBER,
+    auto_scale_physics: bool = True,
+    physics_loss_target_ratio: float = 1.0,
+) -> DiffusionConfig:
+    """Migrate a cfgConditional config to the current physics-aware config.
+
+    Architecture and diffusion settings are retained from the checkpoint.
+    Physics settings are deliberately supplied by the continuation run because
+    legacy cfgConditional checkpoints contain an older diagnostic PDE config
+    and do not contain all fields required by the Kolmogorov residual.
+    """
+    if additional_epochs <= 0:
+        raise ValueError("additional_epochs must be positive")
+    if dt_phys <= 0:
+        raise ValueError("dt_phys must be positive")
+    if reynolds_number <= 0:
+        raise ValueError("reynolds_number must be positive")
+    if not math.isclose(
+        viscosity, 1.0 / reynolds_number, rel_tol=1e-7, abs_tol=1e-12
+    ):
+        raise ValueError(
+            "viscosity must equal 1 / reynolds_number; "
+            f"got viscosity={viscosity}, reynolds_number={reynolds_number}"
+        )
+    if forcing_wavenumber <= 0:
+        raise ValueError("forcing_wavenumber must be positive")
+    if physics_loss_target_ratio <= 0:
+        raise ValueError("physics_loss_target_ratio must be positive")
+
+    cfg = _diffusion_config_from_ckpt(cfg_dict)
+    cfg.epochs = int(additional_epochs)
+    cfg.dt_phys = float(dt_phys)
+    cfg.reynolds_number = float(reynolds_number)
+    cfg.viscosity = float(viscosity)
+    cfg.forcing_wavenumber = int(forcing_wavenumber)
+    cfg.low_freq_k_cutoff = None
+    cfg.auto_scale_physics = bool(auto_scale_physics)
+    cfg.physics_loss_target_ratio = float(physics_loss_target_ratio)
+    return cfg
 
 
 def mlflow_last_logged_step(tracking_uri: str, run_id: str, metric_name: str = "train_loss") -> int:
@@ -1240,19 +1298,35 @@ def run_training_resume(
     mlflow_run_id: Optional[str] = None,
     seed: int = 0,
     epoch_offset: Optional[int] = None,
+    restore_optimizer: bool = True,
+    dt_phys: float = KOLMOGOROV_DT_PHYS,
+    reynolds_number: float = KOLMOGOROV_REYNOLDS_NUMBER,
+    viscosity: float = KOLMOGOROV_VISCOSITY,
+    forcing_wavenumber: int = KOLMOGOROV_FORCING_WAVENUMBER,
+    auto_scale_physics: bool = True,
+    physics_loss_target_ratio: float = 1.0,
 ):
     """
-    Resume training from a checkpoint produced by `run_training` (ddpm_sparse_cfg).
+    Extend a checkpoint produced by ddpm_sparse_cfg/cfgConditional.py.
 
-    - Reloads model weights and (if present) optimizer + GradScaler state.
+    - Reloads the compatible ConditionalDDPM model weights.
+    - Reloads optimizer and GradScaler state when requested and compatible.
     - Uses `train_mean` / `train_std` from the checkpoint (same normalization as original run).
+    - Migrates the legacy config to the current five-frame physics objective.
+    - Overrides legacy PDE values with the Kolmogorov simulation settings passed
+      to this function (defaults match kolmogorov_demo.ipynb).
     - If `mlflow_run_id` is set, continues that MLflow run and logs metrics with `step` after the
       last logged `train_loss` step (or `epoch_offset` if you pass it explicitly).
-    - If `mlflow_run_id` is None, starts a new MLflow run named `cfg_conditional_ddpm_resume`.
+    - If `mlflow_run_id` is None, starts a new MLflow continuation run.
 
     Returns:
         (best_ckpt_path, (train_mean, train_std), cfg)
     """
+    if additional_epochs <= 0:
+        raise ValueError("additional_epochs must be positive")
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
     os.makedirs(out_dir, exist_ok=True)
     seed_everything(seed)
     device = default_device()
@@ -1263,9 +1337,35 @@ def run_training_resume(
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     except TypeError:
         ckpt = torch.load(ckpt_path, map_location=device)
+    required_keys = {"model", "cfg", "train_mean", "train_std"}
+    missing_keys = sorted(required_keys.difference(ckpt))
+    if missing_keys:
+        raise KeyError(f"Checkpoint is missing required keys: {missing_keys}")
+
     train_mean = float(ckpt["train_mean"])
     train_std = float(ckpt["train_std"])
-    cfg = _diffusion_config_from_ckpt(ckpt["cfg"])
+    if not math.isfinite(train_std) or train_std <= 0:
+        raise ValueError(f"Checkpoint train_std must be positive, got {train_std}")
+
+    legacy_cfg = ckpt["cfg"]
+    cfg = _cfgconditional_resume_config(
+        legacy_cfg,
+        additional_epochs=additional_epochs,
+        dt_phys=dt_phys,
+        reynolds_number=reynolds_number,
+        viscosity=viscosity,
+        forcing_wavenumber=forcing_wavenumber,
+        auto_scale_physics=auto_scale_physics,
+        physics_loss_target_ratio=physics_loss_target_ratio,
+    )
+    print("Loaded diffusion/model settings from the cfgConditional checkpoint.")
+    print(
+        "Continuation physics: "
+        f"dt={cfg.dt_phys}, Re={cfg.reynolds_number}, nu={cfg.viscosity}, "
+        f"forcing k={cfg.forcing_wavenumber}, "
+        f"auto_scale={cfg.auto_scale_physics}, "
+        f"target_ratio={cfg.physics_loss_target_ratio}"
+    )
 
     if isinstance(data, np.ndarray):
         data_t = torch.from_numpy(data)
@@ -1274,7 +1374,10 @@ def run_training_resume(
     else:
         raise TypeError("data must be a numpy array or torch tensor")
 
-    assert data_t.ndim == 3 and data_t.shape[1:] == (64, 64), f"Expected (N,64,64), got {data_t.shape}"
+    if data_t.ndim != 3 or data_t.shape[1:] != (64, 64):
+        raise ValueError(f"Expected real physical vorticity with shape (N,64,64), got {data_t.shape}")
+    if torch.is_complex(data_t):
+        raise ValueError("Expected real physical-space vorticity, got complex data")
     N = data_t.shape[0]
     n_train = int(0.8 * N)
     train_full = data_t[:n_train]
@@ -1282,6 +1385,13 @@ def run_training_resume(
 
     train_ds = NavierStokesSparseDataset(train_full, mean=train_mean, std=train_std, sensor_stride=8)
     test_ds = NavierStokesSparseDataset(test_full, mean=train_mean, std=train_std, sensor_stride=8)
+    if len(train_ds) < cfg.batch_size:
+        raise ValueError(
+            "Training split is too small for drop_last=True: "
+            f"{len(train_ds)} windows for batch_size={cfg.batch_size}"
+        )
+    if len(test_ds) == 0:
+        raise ValueError("Test split must contain at least five consecutive frames")
 
     train_loader = DataLoader(
         train_ds,
@@ -1301,16 +1411,28 @@ def run_training_resume(
     )
 
     model = ConditionalDDPM(T=cfg.T, emb_dim=256, base_ch=64)
-    model.load_state_dict(ckpt["model"])
+    try:
+        model.load_state_dict(ckpt["model"], strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "The checkpoint model is not architecture-compatible with "
+            "ddpm_sparse_cfg/cfgConditional.py and the current ConditionalDDPM"
+        ) from exc
     trainer = DDPMTrainer(model, cfg, device, data_mean=train_mean, data_std=train_std)
 
-    if "optimizer" in ckpt and ckpt["optimizer"] is not None:
-        trainer.opt.load_state_dict(ckpt["optimizer"])
-        print("Loaded optimizer state from checkpoint.")
-    else:
+    if restore_optimizer and ckpt.get("optimizer") is not None:
+        try:
+            trainer.opt.load_state_dict(ckpt["optimizer"])
+            print("Loaded optimizer state from checkpoint.")
+        except (ValueError, RuntimeError) as exc:
+            trainer.opt = torch.optim.AdamW(trainer.model.parameters(), lr=cfg.lr)
+            print(f"Could not load optimizer state; using a fresh AdamW optimizer: {exc}")
+    elif restore_optimizer:
         print("No optimizer state in checkpoint; optimizer reinitialized.")
+    else:
+        print("Optimizer restoration disabled; optimizer reinitialized.")
 
-    if "scaler" in ckpt and ckpt["scaler"] is not None:
+    if restore_optimizer and ckpt.get("scaler") is not None:
         try:
             trainer.scaler.load_state_dict(ckpt["scaler"])
             print("Loaded GradScaler state from checkpoint.")
@@ -1335,7 +1457,10 @@ def run_training_resume(
         print(f"Starting new MLflow run; metric steps start after {start_step} (next step = {start_step + 1}).")
 
     ckpt_best_path = os.path.join(out_dir, "best.pt")
-    best_test = float(ckpt.get("best_test_recon_mse", float("inf")))
+    # Treat the physics-enabled continuation as a new selection phase. This
+    # guarantees that out_dir/best.pt is created even when the legacy checkpoint
+    # did not store a comparable best-test metric.
+    best_test = float("inf")
 
     run_ctx = (
         mlflow.start_run(run_id=mlflow_run_id)
@@ -1376,6 +1501,7 @@ def run_training_resume(
                 "scaler": trainer.scaler.state_dict() if hasattr(trainer.scaler, "state_dict") else None,
                 "best_test_recon_mse": best_test,
                 "mlflow_run_id": active_run_id,
+                "resumed_from_ckpt": os.path.abspath(ckpt_path),
             }
             torch.save(payload, os.path.join(out_dir, "conditional.pt"))
 
@@ -1404,7 +1530,7 @@ def run_training_resume(
             if math.isnan(test_mse):
                 test_mse = float("inf")
 
-            if test_mse < best_test:
+            if i == 1 or test_mse < best_test:
                 best_test = test_mse
                 payload["best_test_recon_mse"] = best_test
                 torch.save(payload, ckpt_best_path)
@@ -1423,6 +1549,7 @@ def run_training_resume(
             "scaler": trainer.scaler.state_dict() if hasattr(trainer.scaler, "state_dict") else None,
             "best_test_recon_mse": best_test,
             "mlflow_run_id": active_run_id,
+            "resumed_from_ckpt": os.path.abspath(ckpt_path),
         },
         os.path.join(out_dir, "conditional.pt"),
     )
