@@ -4,9 +4,10 @@ Edit the values in the USER SETTINGS block, then run:
 
     python PIDM/train_extend.py
 
-The source checkpoint is never overwritten when OUTPUT_DIR points to a new
-directory. New ``conditional.pt`` and ``best.pt`` checkpoints are written to
-OUTPUT_DIR.
+The source checkpoint is never overwritten because it is loaded from the
+``pure_diffusion`` subdirectory. New ``conditional.pt`` and ``best.pt`` files
+are written to CHECKPOINT_OUTPUT_DIR, while MLflow data is written to
+MLFLOW_DIR.
 """
 
 from pathlib import Path
@@ -43,9 +44,9 @@ DATA_PATH = Path(
     "/content/drive/MyDrive/Lab/CondDiff/NSE_Data_new.npy"
 )
 
-# Use a new directory if you want to preserve the original checkpoint files.
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-OUTPUT_DIR = PROJECT_ROOT / "PIDM" / "extended_training"
+# Continued-training checkpoints and MLflow data are stored separately.
+CHECKPOINT_OUTPUT_DIR = Path("/content/drive/MyDrive/Lab/CondDiff")
+MLFLOW_DIR = Path("/content/drive/MyDrive/Lab/CondDiff/mlflow")
 
 # Number of new physics-informed epochs to run.
 ADDITIONAL_EPOCHS = 10
@@ -54,7 +55,7 @@ SEED = 0
 RESTORE_OPTIMIZER = True
 
 # Starts a new MLflow run by default. Set this to an existing run ID only when
-# that run lives under OUTPUT_DIR/mlruns and you intentionally want to append.
+# that run lives under MLFLOW_DIR and you intentionally want to append.
 MLFLOW_RUN_ID = None
 EPOCH_OFFSET = None
 
@@ -94,7 +95,8 @@ def main() -> None:
 
     print(f"Checkpoint:        {CHECKPOINT_PATH.resolve()}")
     print(f"Data:              {DATA_PATH.resolve()} {data.shape} {data.dtype}")
-    print(f"Output directory:  {OUTPUT_DIR.resolve()}")
+    print(f"Checkpoint output: {CHECKPOINT_OUTPUT_DIR.resolve()}")
+    print(f"MLflow directory:  {MLFLOW_DIR.resolve()}")
     print(f"Additional epochs: {ADDITIONAL_EPOCHS}")
     print(
         "Physics:           "
@@ -105,8 +107,9 @@ def main() -> None:
     best_path, stats, cfg = run_training_resume(
         data=data,
         ckpt_path=str(CHECKPOINT_PATH),
-        out_dir=str(OUTPUT_DIR),
+        out_dir=str(CHECKPOINT_OUTPUT_DIR),
         additional_epochs=ADDITIONAL_EPOCHS,
+        mlflow_dir=str(MLFLOW_DIR),
         mlflow_run_id=MLFLOW_RUN_ID,
         seed=SEED,
         epoch_offset=EPOCH_OFFSET,

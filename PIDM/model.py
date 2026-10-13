@@ -1305,6 +1305,7 @@ def run_training_resume(
     forcing_wavenumber: int = KOLMOGOROV_FORCING_WAVENUMBER,
     auto_scale_physics: bool = True,
     physics_loss_target_ratio: float = 1.0,
+    mlflow_dir: Optional[str] = None,
 ):
     """
     Extend a checkpoint produced by ddpm_sparse_cfg/cfgConditional.py.
@@ -1315,6 +1316,8 @@ def run_training_resume(
     - Migrates the legacy config to the current five-frame physics objective.
     - Overrides legacy PDE values with the Kolmogorov simulation settings passed
       to this function (defaults match kolmogorov_demo.ipynb).
+    - Writes checkpoints to `out_dir` and MLflow tracking data to `mlflow_dir`.
+      If `mlflow_dir` is omitted, it defaults to `out_dir/mlruns`.
     - If `mlflow_run_id` is set, continues that MLflow run and logs metrics with `step` after the
       last logged `train_loss` step (or `epoch_offset` if you pass it explicitly).
     - If `mlflow_run_id` is None, starts a new MLflow continuation run.
@@ -1328,6 +1331,10 @@ def run_training_resume(
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     os.makedirs(out_dir, exist_ok=True)
+    resolved_mlflow_dir = os.path.abspath(
+        mlflow_dir if mlflow_dir is not None else os.path.join(out_dir, "mlruns")
+    )
+    os.makedirs(resolved_mlflow_dir, exist_ok=True)
     seed_everything(seed)
     device = default_device()
     print("Device:", device)
@@ -1439,10 +1446,11 @@ def run_training_resume(
         except Exception as e:
             print(f"Could not load GradScaler state: {e}")
 
-    # Must match run_training: file:{out_dir}/mlruns (use same absolute path for metric lookup)
-    mlflow_uri = f"file:{os.path.abspath(os.path.join(out_dir, 'mlruns'))}"
+    mlflow_uri = f"file:{resolved_mlflow_dir}"
     mlflow.set_tracking_uri(mlflow_uri)
     mlflow.set_experiment("pidm_2dns")
+    print(f"Checkpoint output directory: {os.path.abspath(out_dir)}")
+    print(f"MLflow tracking directory:   {resolved_mlflow_dir}")
 
     if mlflow_run_id:
         if epoch_offset is not None:
