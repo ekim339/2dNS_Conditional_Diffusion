@@ -46,7 +46,7 @@ DATA_PATH = Path(
 
 # Continued-training checkpoints and MLflow data are stored separately.
 CHECKPOINT_OUTPUT_DIR = Path("/content/drive/MyDrive/Lab/CondDiff")
-MLFLOW_DIR = Path("/content/drive/MyDrive/Lab/CondDiff/mlflow")
+MLFLOW_DIR = Path("/content/drive/MyDrive/Lab/CondDiff/mlruns")
 
 # Number of new physics-informed epochs to run.
 ADDITIONAL_EPOCHS = 10

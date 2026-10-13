@@ -397,7 +397,13 @@ class DiffusionConfig:
     lambda_phys_max: float = 1e-10
     lambda_phys_warmup_ratio: float = 0.8
     auto_scale_physics: bool = True
+    # Maximum weighted-physics/data-loss ratio after the warmup ramp.
     physics_loss_target_ratio: float = 1.0
+    physics_loss_target_warmup_ratio: float = 0.8
+    # Every batch uses exactly this many independently selected examples for
+    # physics, with diffusion timesteps sampled uniformly from [0, t_max).
+    physics_examples_per_batch: int = 8
+    physics_t_max: int = 100
     physics_scale_epsilon: float = 1e-12
     dt_phys: float = KOLMOGOROV_DT_PHYS
     reynolds_number: float = KOLMOGOROV_REYNOLDS_NUMBER
@@ -426,6 +432,21 @@ class DDPMTrainer:
 
         if cfg.physics_loss_target_ratio < 0:
             raise ValueError("physics_loss_target_ratio must be nonnegative")
+        if not 0 < cfg.physics_loss_target_warmup_ratio <= 1:
+            raise ValueError(
+                "physics_loss_target_warmup_ratio must be in (0, 1]"
+            )
+        if cfg.physics_examples_per_batch <= 0:
+            raise ValueError("physics_examples_per_batch must be positive")
+        if cfg.physics_examples_per_batch > cfg.batch_size:
+            raise ValueError(
+                "physics_examples_per_batch cannot exceed batch_size; "
+                f"got {cfg.physics_examples_per_batch} and {cfg.batch_size}"
+            )
+        if not 0 < cfg.physics_t_max <= cfg.T:
+            raise ValueError(
+                f"physics_t_max must be in [1, T={cfg.T}], got {cfg.physics_t_max}"
+            )
         if cfg.physics_scale_epsilon <= 0:
             raise ValueError("physics_scale_epsilon must be positive")
         if cfg.reynolds_number <= 0:
@@ -674,6 +695,29 @@ class DDPMTrainer:
         return lambda_start + ramp * (lambda_max - lambda_start)
 
     @staticmethod
+    def get_physics_target_ratio(
+        epoch: int,
+        total_epochs: int,
+        max_target_ratio: float,
+        warmup_ratio: float,
+    ) -> float:
+        """Linearly ramp the adaptive physics/data target from zero.
+
+        Epoch 1 has no PDE contribution. The target reaches
+        ``max_target_ratio`` at the end of the configured warmup interval.
+        """
+        if epoch <= 0 or total_epochs <= 0:
+            raise ValueError("epoch and total_epochs must be positive")
+        if max_target_ratio < 0:
+            raise ValueError("max_target_ratio must be nonnegative")
+        if not 0 < warmup_ratio <= 1:
+            raise ValueError("warmup_ratio must be in (0, 1]")
+
+        warmup_epochs = max(2, math.ceil(total_epochs * warmup_ratio))
+        progress = min(max((epoch - 1) / (warmup_epochs - 1), 0.0), 1.0)
+        return max_target_ratio * progress
+
+    @staticmethod
     def scale_physics_loss_to_data(
         loss_diff: torch.Tensor,
         loss_phys: torch.Tensor,
@@ -712,8 +756,19 @@ class DDPMTrainer:
         num_batches = len(loader)
         lambda_smooth_space = 1e-7
         lambda_smooth_time = 2e-6
+        physics_target_ratio_epoch = self.get_physics_target_ratio(
+            epoch=epoch,
+            total_epochs=self.cfg.epochs,
+            max_target_ratio=self.cfg.physics_loss_target_ratio,
+            warmup_ratio=self.cfg.physics_loss_target_warmup_ratio,
+        )
 
-        print(f"  Starting epoch {epoch} ({num_batches} batches)...")
+        print(
+            f"  Starting epoch {epoch} ({num_batches} batches) | "
+            f"physics examples/batch={self.cfg.physics_examples_per_batch}, "
+            f"t_phys in [0,{self.cfg.physics_t_max}), "
+            f"target ratio={physics_target_ratio_epoch:.6f}"
+        )
 
         for batch_idx, (
             omega_before,
@@ -768,84 +823,112 @@ class DDPMTrainer:
 
                 loss_diff = loss / max(denom, 1)
 
-                phys_t_max = 100 
-                idx_phys = idx_c[t[idx_c] < phys_t_max] if idx_c.numel() > 0 else idx_c
-
-                if idx_phys.numel() > 0:
-                    t_p = t[idx_phys]
-
-                    sqrt_acp = extract(self.sqrt_alphas_cumprod, t, x_t.shape)[idx_phys]
-                    sqrt_om = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)[idx_phys]
-
-                    eps_pred_center = self.model(x_t[idx_phys], t_p, cond[idx_phys])
-                    x0_pred = (x_t[idx_phys] - sqrt_om * eps_pred_center) / (sqrt_acp + 1e-8)
-
-                    def predict_clean_neighbor(field, field_cond):
-                        neighbor_noise = torch.randn_like(field[idx_phys])
-                        neighbor_noisy = self.q_sample(field[idx_phys], t_p, neighbor_noise)
-                        neighbor_eps = self.model(neighbor_noisy, t_p, field_cond[idx_phys])
-                        return (neighbor_noisy - sqrt_om * neighbor_eps) / (
-                            sqrt_acp + 1e-8
-                        )
-
-                    x_minus_2_pred = predict_clean_neighbor(omega_minus_2, cond_minus_2)
-                    x_minus_1_pred = predict_clean_neighbor(omega_minus_1, cond_minus_1)
-                    x_plus_1_pred = predict_clean_neighbor(omega_plus_1, cond_plus_1)
-                    x_plus_2_pred = predict_clean_neighbor(omega_plus_2, cond_plus_2)
-
-                    scale = self.data_std + 1e-8
-                    x0_phys = x0_pred * scale + self.data_mean
-                    omega_minus_2_phys = x_minus_2_pred * scale + self.data_mean
-                    omega_minus_1_phys = x_minus_1_pred * scale + self.data_mean
-                    omega_plus_1_phys = x_plus_1_pred * scale + self.data_mean
-                    omega_plus_2_phys = x_plus_2_pred * scale + self.data_mean
-
-                    loss_smooth_space = self.spatial_smoothness_loss(x0_phys)
-                    loss_smooth_time = self.temporal_second_difference_loss(
-                        omega_minus_1_phys,
-                        x0_phys,
-                        omega_plus_1_phys,
+                # Physics sampling is independent of the diffusion-loss
+                # timesteps and condition-dropout split above. This guarantees
+                # a fixed amount of PDE supervision in every full batch.
+                n_phys = self.cfg.physics_examples_per_batch
+                if B < n_phys:
+                    raise ValueError(
+                        f"Batch has {B} examples, but physics_examples_per_batch={n_phys}"
                     )
+                idx_phys = torch.randperm(B, device=self.device)[:n_phys]
+                t_phys = torch.randint(
+                    0,
+                    self.cfg.physics_t_max,
+                    (n_phys,),
+                    device=self.device,
+                    dtype=torch.long,
+                )
 
-                    # FFT operations stay in float32 even when network inference
-                    # above uses AMP, matching the evaluator's spatial precision.
-                    residual = self.pde_residual(
-                        omega_minus_2_phys.float(),
-                        omega_minus_1_phys.float(),
-                        x0_phys.float(),
-                        omega_plus_1_phys.float(),
-                        omega_plus_2_phys.float(),
+                center_noise = torch.randn_like(x0[idx_phys])
+                x_t_phys = self.q_sample(x0[idx_phys], t_phys, center_noise)
+                sqrt_acp_phys = extract(
+                    self.sqrt_alphas_cumprod, t_phys, x_t_phys.shape
+                )
+                sqrt_om_phys = extract(
+                    self.sqrt_one_minus_alphas_cumprod, t_phys, x_t_phys.shape
+                )
+
+                eps_pred_center = self.model(
+                    x_t_phys, t_phys, cond[idx_phys]
+                )
+                x0_pred = (
+                    x_t_phys - sqrt_om_phys * eps_pred_center
+                ) / (sqrt_acp_phys + 1e-8)
+
+                def predict_clean_neighbor(field, field_cond):
+                    selected_field = field[idx_phys]
+                    neighbor_noise = torch.randn_like(selected_field)
+                    neighbor_noisy = self.q_sample(
+                        selected_field, t_phys, neighbor_noise
                     )
-                    loss_phys = F.mse_loss(residual, torch.zeros_like(residual))
-                else:
-                    loss_phys = torch.tensor(0.0, device=x_t.device)
-                    loss_smooth_space = torch.tensor(0.0, device=x_t.device)
-                    loss_smooth_time = torch.tensor(0.0, device=x_t.device)
-                    residual = None
+                    neighbor_eps = self.model(
+                        neighbor_noisy, t_phys, field_cond[idx_phys]
+                    )
+                    return (
+                        neighbor_noisy - sqrt_om_phys * neighbor_eps
+                    ) / (sqrt_acp_phys + 1e-8)
 
-                lambda_phys_epoch = self.get_lambda_phys(
-                    epoch=epoch,
-                    total_epochs=self.cfg.epochs,
-                    lambda_start=self.cfg.lambda_phys_start,
-                    lambda_max=self.cfg.lambda_phys_max,
-                    warmup_ratio=self.cfg.lambda_phys_warmup_ratio,
+                x_minus_2_pred = predict_clean_neighbor(
+                    omega_minus_2, cond_minus_2
+                )
+                x_minus_1_pred = predict_clean_neighbor(
+                    omega_minus_1, cond_minus_1
+                )
+                x_plus_1_pred = predict_clean_neighbor(
+                    omega_plus_1, cond_plus_1
+                )
+                x_plus_2_pred = predict_clean_neighbor(
+                    omega_plus_2, cond_plus_2
+                )
+
+                scale = self.data_std + 1e-8
+                x0_phys = x0_pred * scale + self.data_mean
+                omega_minus_2_phys = x_minus_2_pred * scale + self.data_mean
+                omega_minus_1_phys = x_minus_1_pred * scale + self.data_mean
+                omega_plus_1_phys = x_plus_1_pred * scale + self.data_mean
+                omega_plus_2_phys = x_plus_2_pred * scale + self.data_mean
+
+                loss_smooth_space = self.spatial_smoothness_loss(x0_phys)
+                loss_smooth_time = self.temporal_second_difference_loss(
+                    omega_minus_1_phys,
+                    x0_phys,
+                    omega_plus_1_phys,
+                )
+
+                # FFT operations stay in float32 even when network inference
+                # above uses AMP, matching the evaluator's spatial precision.
+                residual = self.pde_residual(
+                    omega_minus_2_phys.float(),
+                    omega_minus_1_phys.float(),
+                    x0_phys.float(),
+                    omega_plus_1_phys.float(),
+                    omega_plus_2_phys.float(),
+                )
+                loss_phys = F.mse_loss(
+                    residual, torch.zeros_like(residual)
                 )
 
                 if self.cfg.auto_scale_physics:
-                    if idx_phys.numel() > 0:
-                        physics_scale, weighted_phys = (
-                            self.scale_physics_loss_to_data(
-                                loss_diff,
-                                loss_phys,
-                                target_ratio=self.cfg.physics_loss_target_ratio,
-                                epsilon=self.cfg.physics_scale_epsilon,
-                            )
+                    physics_scale, weighted_phys = (
+                        self.scale_physics_loss_to_data(
+                            loss_diff,
+                            loss_phys,
+                            target_ratio=physics_target_ratio_epoch,
+                            epsilon=self.cfg.physics_scale_epsilon,
                         )
-                    else:
-                        physics_scale = loss_phys.new_zeros(())
-                        weighted_phys = loss_phys
+                    )
                     weighted_phys_raw = weighted_phys
                 else:
+                    # Legacy fixed-coefficient mode computes lambda only when
+                    # it is actually used.
+                    lambda_phys_epoch = self.get_lambda_phys(
+                        epoch=epoch,
+                        total_epochs=self.cfg.epochs,
+                        lambda_start=self.cfg.lambda_phys_start,
+                        lambda_max=self.cfg.lambda_phys_max,
+                        warmup_ratio=self.cfg.lambda_phys_warmup_ratio,
+                    )
                     physics_scale = loss_phys.new_tensor(lambda_phys_epoch)
                     weighted_phys_raw = physics_scale * loss_phys
                     weighted_phys = torch.clamp(weighted_phys_raw, max=5.0)
@@ -1141,6 +1224,16 @@ def run_training(
             mlflow.log_metric("train_loss_physics", float(train_loss_physics), step=epoch)
             mlflow.log_metric("train_loss_physics_weighted", float(train_loss_physics_weighted), step=epoch)
             mlflow.log_metric("train_loss_physics_scale", float(train_loss_physics_scale), step=epoch)
+            mlflow.log_metric(
+                "physics_loss_target_ratio",
+                trainer.get_physics_target_ratio(
+                    epoch=epoch,
+                    total_epochs=cfg.epochs,
+                    max_target_ratio=cfg.physics_loss_target_ratio,
+                    warmup_ratio=cfg.physics_loss_target_warmup_ratio,
+                ),
+                step=epoch,
+            )
             mlflow.log_metric("train_loss_spatial_nonsmoothness", float(train_loss_spatial_nonsmoothness), step=epoch)
             mlflow.log_metric("train_loss_time_acceleration", float(train_loss_time_acceleration), step=epoch)
             mlflow.log_metric("test_recon_mse", float(test_mse), step=epoch)
@@ -1243,6 +1336,9 @@ def _cfgconditional_resume_config(
     forcing_wavenumber: int = KOLMOGOROV_FORCING_WAVENUMBER,
     auto_scale_physics: bool = True,
     physics_loss_target_ratio: float = 1.0,
+    physics_loss_target_warmup_ratio: float = 0.8,
+    physics_examples_per_batch: int = 8,
+    physics_t_max: int = 100,
 ) -> DiffusionConfig:
     """Migrate a cfgConditional config to the current physics-aware config.
 
@@ -1266,8 +1362,16 @@ def _cfgconditional_resume_config(
         )
     if forcing_wavenumber <= 0:
         raise ValueError("forcing_wavenumber must be positive")
-    if physics_loss_target_ratio <= 0:
-        raise ValueError("physics_loss_target_ratio must be positive")
+    if physics_loss_target_ratio < 0:
+        raise ValueError("physics_loss_target_ratio must be nonnegative")
+    if not 0 < physics_loss_target_warmup_ratio <= 1:
+        raise ValueError(
+            "physics_loss_target_warmup_ratio must be in (0, 1]"
+        )
+    if physics_examples_per_batch <= 0:
+        raise ValueError("physics_examples_per_batch must be positive")
+    if physics_t_max <= 0:
+        raise ValueError("physics_t_max must be positive")
 
     cfg = _diffusion_config_from_ckpt(cfg_dict)
     cfg.epochs = int(additional_epochs)
@@ -1278,6 +1382,11 @@ def _cfgconditional_resume_config(
     cfg.low_freq_k_cutoff = None
     cfg.auto_scale_physics = bool(auto_scale_physics)
     cfg.physics_loss_target_ratio = float(physics_loss_target_ratio)
+    cfg.physics_loss_target_warmup_ratio = float(
+        physics_loss_target_warmup_ratio
+    )
+    cfg.physics_examples_per_batch = int(physics_examples_per_batch)
+    cfg.physics_t_max = int(physics_t_max)
     return cfg
 
 
@@ -1305,6 +1414,9 @@ def run_training_resume(
     forcing_wavenumber: int = KOLMOGOROV_FORCING_WAVENUMBER,
     auto_scale_physics: bool = True,
     physics_loss_target_ratio: float = 1.0,
+    physics_loss_target_warmup_ratio: float = 0.8,
+    physics_examples_per_batch: int = 8,
+    physics_t_max: int = 100,
     mlflow_dir: Optional[str] = None,
 ):
     """
@@ -1364,6 +1476,9 @@ def run_training_resume(
         forcing_wavenumber=forcing_wavenumber,
         auto_scale_physics=auto_scale_physics,
         physics_loss_target_ratio=physics_loss_target_ratio,
+        physics_loss_target_warmup_ratio=physics_loss_target_warmup_ratio,
+        physics_examples_per_batch=physics_examples_per_batch,
+        physics_t_max=physics_t_max,
     )
     print("Loaded diffusion/model settings from the cfgConditional checkpoint.")
     print(
@@ -1371,7 +1486,10 @@ def run_training_resume(
         f"dt={cfg.dt_phys}, Re={cfg.reynolds_number}, nu={cfg.viscosity}, "
         f"forcing k={cfg.forcing_wavenumber}, "
         f"auto_scale={cfg.auto_scale_physics}, "
-        f"target_ratio={cfg.physics_loss_target_ratio}"
+        f"target_ratio_max={cfg.physics_loss_target_ratio}, "
+        f"target_warmup={cfg.physics_loss_target_warmup_ratio}, "
+        f"physics_examples/batch={cfg.physics_examples_per_batch}, "
+        f"t_phys=[0,{cfg.physics_t_max})"
     )
 
     if isinstance(data, np.ndarray):
@@ -1484,6 +1602,18 @@ def run_training_resume(
             mlflow.log_param("train_mean", train_mean)
             mlflow.log_param("train_std", train_std)
             mlflow.log_param("additional_epochs", additional_epochs)
+            mlflow.log_param(
+                "physics_examples_per_batch", cfg.physics_examples_per_batch
+            )
+            mlflow.log_param("physics_t_max", cfg.physics_t_max)
+            mlflow.log_param(
+                "physics_loss_target_ratio_max",
+                cfg.physics_loss_target_ratio,
+            )
+            mlflow.log_param(
+                "physics_loss_target_warmup_ratio",
+                cfg.physics_loss_target_warmup_ratio,
+            )
             log_physics_mlflow_params(
                 grid_size=64,
                 dt_phys=cfg.dt_phys,
@@ -1521,6 +1651,16 @@ def run_training_resume(
             mlflow.log_metric("train_loss_physics", float(train_loss_physics), step=log_step)
             mlflow.log_metric("train_loss_physics_weighted", float(train_loss_physics_weighted), step=log_step)
             mlflow.log_metric("train_loss_physics_scale", float(train_loss_physics_scale), step=log_step)
+            mlflow.log_metric(
+                "physics_loss_target_ratio",
+                trainer.get_physics_target_ratio(
+                    epoch=i,
+                    total_epochs=cfg.epochs,
+                    max_target_ratio=cfg.physics_loss_target_ratio,
+                    warmup_ratio=cfg.physics_loss_target_warmup_ratio,
+                ),
+                step=log_step,
+            )
             mlflow.log_metric("train_loss_spatial_nonsmoothness", float(train_loss_spatial_nonsmoothness), step=log_step)
             mlflow.log_metric("train_loss_time_acceleration", float(train_loss_time_acceleration), step=log_step)
             mlflow.log_metric("test_recon_mse", float(test_mse), step=log_step)
