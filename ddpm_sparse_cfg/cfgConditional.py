@@ -9,13 +9,13 @@
 #
 # What this does:
 # - Splits first 80% train, last 20% test.
-# - Uses the full normalized 64x64 field as the conditioning signal y.
+# - Uses sparse normalized observations plus their binary mask as condition y.
 # - Trains a conditional DDPM with CFG: randomly drops condition during training.
 # - Provides sampling with CFG to reconstruct 64x64 fields from 64x64 observations.
 #
 # Notes:
-# - The conditioning field y is concatenated with x_t along the channel dim
-#   to form a 2-channel input to the U-Net: model_input = cat([x_t, y], dim=1).
+# - The two-channel condition y is concatenated with x_t along the channel dim
+#   to form a 3-channel U-Net input: model_input = cat([x_t, y], dim=1).
 # - FiLM modulation carries only the timestep embedding.
 # - For unconditional forward passes (CFG dropout), y is replaced with zeros.
 # ============================================
@@ -84,7 +84,7 @@ def extract(a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tens
 
 
 # -------------------------
-# Dataset: fixed split, full 64x64 field used as both target x0 and condition y
+# Dataset: fixed split and the same five-frame windows used by PIDM/model.py
 # -------------------------
 class NavierStokesSparseDataset(Dataset):
     def __init__(
@@ -94,9 +94,11 @@ class NavierStokesSparseDataset(Dataset):
         std: float,
         sensor_stride: int = 8,
     ):
-        """
-        sensor_stride=8 on a 64x64 grid gives an 8x8 observation lattice
-        (i.e. 64 observed points total).
+        """Build the same five-frame windows consumed by PIDM/model.py.
+
+        The pure diffusion stage only optimizes the center-frame data loss,
+        but retaining the two neighboring frames on each side makes its center
+        examples identical to the later physics-informed stage.
         """
         assert full_fields.ndim == 3 and full_fields.shape[1:] == (64, 64)
         self.x = full_fields.float()
@@ -105,8 +107,7 @@ class NavierStokesSparseDataset(Dataset):
         self.sensor_stride = int(sensor_stride)
 
     def __len__(self):
-        # Need both neighbors (k-1, k+1) for physics-loss diagnostics.
-        return max(0, self.x.shape[0] - 2)
+        return max(0, self.x.shape[0] - 4)
 
     def _normalize(self, field: torch.Tensor) -> torch.Tensor:
         return (field - self.mean) / (self.std + 1e-8)
@@ -118,22 +119,30 @@ class NavierStokesSparseDataset(Dataset):
         return torch.stack([y_sparse, mask], dim=0)  # (2,64,64)
 
     def __getitem__(self, idx: int):
-        k = idx + 1
-        x_prev = self._normalize(self.x[k - 1])
+        k = idx + 2
+        x_minus_2 = self._normalize(self.x[k - 2])
+        x_minus_1 = self._normalize(self.x[k - 1])
         x0 = self._normalize(self.x[k])
-        x_next = self._normalize(self.x[k + 1])
+        x_plus_1 = self._normalize(self.x[k + 1])
+        x_plus_2 = self._normalize(self.x[k + 2])
 
-        cond_prev = self._sparse_cond(x_prev)
+        omega_before = torch.stack([x_minus_2, x_minus_1], dim=0).unsqueeze(1)
+        omega_after = torch.stack([x_plus_1, x_plus_2], dim=0).unsqueeze(1)
+        cond_before = torch.stack(
+            [self._sparse_cond(x_minus_2), self._sparse_cond(x_minus_1)], dim=0
+        )
         cond = self._sparse_cond(x0)
-        cond_next = self._sparse_cond(x_next)
+        cond_after = torch.stack(
+            [self._sparse_cond(x_plus_1), self._sparse_cond(x_plus_2)], dim=0
+        )
 
         return (
-            x_prev.unsqueeze(0),
+            omega_before,
             x0.unsqueeze(0),
-            x_next.unsqueeze(0),
-            cond_prev,
+            omega_after,
+            cond_before,
             cond,
-            cond_next,
+            cond_after,
         )
 
 # -------------------------
@@ -320,17 +329,20 @@ class ConditionalDDPM(nn.Module):
 class DiffusionConfig:
     T: int = 1000
     beta_schedule: str = "cosine"
+    emb_dim: int = 256
+    base_ch: int = 64
     drop_prob: float = 0     # CFG condition dropout probability
     lr: float = 2e-4
     batch_size: int = 64
     num_workers: int = 0  # Set to 0 for macOS compatibility (multiprocessing issues)
     grad_clip: float = 1.0
-    epochs: int = 10
+    epochs: int = 30
     guidance_scale: float = 1.0  # CFG sampling scale
     use_amp: bool = True
-    dt_phys: float = 1e-3
-    viscosity: float = 0.004
-    low_freq_k_cutoff: Optional[float] = 2.0
+    # Canonical MLflow data-loss evaluation. A fixed ordered subset, diffusion
+    # timesteps, and noise make the CFG/PIDM checkpoint handoff reproducible.
+    data_loss_eval_seed: int = 0
+    data_loss_eval_batches: int = 8
 
 
 class DDPMTrainer:
@@ -347,7 +359,6 @@ class DDPMTrainer:
         self.device = device
         self.data_mean = float(data_mean)
         self.data_std = float(data_std)
-        self.dt = cfg.dt_phys
 
         betas = make_beta_schedule(cfg.T, cfg.beta_schedule).to(device)
         alphas = 1.0 - betas
@@ -369,57 +380,6 @@ class DDPMTrainer:
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         return extract(self.sqrt_alphas_cumprod, t, x0.shape) * x0 + \
                extract(self.sqrt_one_minus_alphas_cumprod, t, x0.shape) * noise
-
-    def pde_residual(
-        self,
-        omega_k_minus_1: torch.Tensor,
-        omega_k: torch.Tensor,
-        omega_k_plus_1: torch.Tensor,
-    ) -> torch.Tensor:
-        dt = self.dt
-        nu = self.cfg.viscosity
-
-        w_prev = omega_k_minus_1.squeeze(1)
-        w_cur = omega_k.squeeze(1)
-        w_next = omega_k_plus_1.squeeze(1)
-
-        _, H, W = w_cur.shape
-        device = w_cur.device
-
-        kx = (2 * math.pi) * torch.fft.fftfreq(H, device=device).view(H, 1)
-        ky = (2 * math.pi) * torch.fft.rfftfreq(W, device=device).view(1, W // 2 + 1)
-        k2 = kx**2 + ky**2
-
-        k_cutoff = self.cfg.low_freq_k_cutoff
-        if k_cutoff is not None and k_cutoff > 0:
-            low_mask = (k2 < (float(k_cutoff) ** 2)).to(dtype=torch.float32)
-            w_prev = torch.fft.irfft2(torch.fft.rfft2(w_prev) * low_mask, s=(H, W))
-            w_cur = torch.fft.irfft2(torch.fft.rfft2(w_cur) * low_mask, s=(H, W))
-            w_next = torch.fft.irfft2(torch.fft.rfft2(w_next) * low_mask, s=(H, W))
-
-        w_fft = torch.fft.rfft2(w_cur)
-        k2_safe = k2.clone()
-        k2_safe[0, 0] = 1.0
-        psi_fft = -w_fft / (k2_safe + 1e-6)
-        psi_fft[..., 0, 0] = 0.0
-
-        u = torch.fft.irfft2(1j * ky * psi_fft, s=(H, W))
-        v = torch.fft.irfft2(-1j * kx * psi_fft, s=(H, W))
-        u = torch.clamp(u, -10.0, 10.0)
-        v = torch.clamp(v, -10.0, 10.0)
-
-        w_x = torch.fft.irfft2(1j * kx * w_fft, s=(H, W))
-        w_y = torch.fft.irfft2(1j * ky * w_fft, s=(H, W))
-        w_x = torch.clamp(w_x, -100.0, 100.0)
-        w_y = torch.clamp(w_y, -100.0, 100.0)
-
-        lap_fft = -(kx**2 + ky**2) * w_fft
-        lap_fft = torch.clamp(lap_fft.real, -1e6, 1e6) + 1j * torch.clamp(lap_fft.imag, -1e6, 1e6)
-        lap_w = torch.fft.irfft2(lap_fft, s=(H, W))
-
-        w_t = (w_next - w_prev) / (2.0 * dt)
-        residual = w_t + u * w_x + v * w_y - nu * lap_w
-        return residual.unsqueeze(1)
 
     def p_mean_variance(self, x_t: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -503,13 +463,9 @@ class DDPMTrainer:
         
         print(f"  Starting epoch {epoch} ({num_batches} batches)...")
 
-        for batch_idx, (omega_prev, x0, omega_next, cond_prev, cond, cond_next) in enumerate(loader):
-            omega_prev = omega_prev.to(self.device)
+        for batch_idx, (_, x0, _, _, cond, _) in enumerate(loader):
             x0 = x0.to(self.device)
-            omega_next = omega_next.to(self.device)
-            cond_prev = cond_prev.to(self.device)
             cond = cond.to(self.device)
-            cond_next = cond_next.to(self.device)
 
             B = x0.size(0)
             t = torch.randint(0, self.cfg.T, (B,), device=self.device, dtype=torch.long)
@@ -545,37 +501,8 @@ class DDPMTrainer:
 
                 loss_diff = loss_weighted / max(denom, 1)
 
-                # Physics diagnostics only (not part of optimized objective).
-                if idx_c.numel() > 0:
-                    t_c = t[idx_c]
-                    sqrt_acp = extract(self.sqrt_alphas_cumprod, t, x_t.shape)[idx_c]
-                    sqrt_om = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)[idx_c]
-
-                    eps_pred_center = self.model(x_t[idx_c], t_c, cond[idx_c])
-                    x0_pred = (x_t[idx_c] - sqrt_om * eps_pred_center) / (sqrt_acp + 1e-8)
-                    x0_pred = torch.clamp(x0_pred, -200.0, 200.0)
-
-                    noise_prev = torch.randn_like(omega_prev[idx_c])
-                    noise_next = torch.randn_like(omega_next[idx_c])
-                    x_t_prev = self.q_sample(omega_prev[idx_c], t_c, noise_prev)
-                    x_t_next = self.q_sample(omega_next[idx_c], t_c, noise_next)
-
-                    eps_pred_prev = self.model(x_t_prev, t_c, cond_prev[idx_c])
-                    eps_pred_next = self.model(x_t_next, t_c, cond_next[idx_c])
-                    x_prev_pred = (x_t_prev - sqrt_om * eps_pred_prev) / (sqrt_acp + 1e-8)
-                    x_next_pred = (x_t_next - sqrt_om * eps_pred_next) / (sqrt_acp + 1e-8)
-                    x_prev_pred = torch.clamp(x_prev_pred, -200.0, 200.0)
-                    x_next_pred = torch.clamp(x_next_pred, -200.0, 200.0)
-
-                    scale = self.data_std + 1e-8
-                    x0_phys = x0_pred * scale + self.data_mean
-                    omega_prev_phys = x_prev_pred * scale + self.data_mean
-                    omega_next_phys = x_next_pred * scale + self.data_mean
-
-                    residual = self.pde_residual(omega_prev_phys, x0_phys, omega_next_phys)
-                    loss_phys = F.mse_loss(residual, torch.zeros_like(residual))
-                else:
-                    loss_phys = torch.tensor(0.0, device=x_t.device)
+                # Pure diffusion stage: PIDM/model.py adds the physics terms.
+                loss_phys = torch.zeros((), device=x_t.device, dtype=loss_diff.dtype)
                 loss = loss_diff
 
             self.scaler.scale(loss).backward()
@@ -609,6 +536,61 @@ class DDPMTrainer:
             f"Average Diff: {avg_diff_loss:.6f} | Average Phys: {avg_phys_loss:.6f}"
         )
         return avg_loss, avg_diff_loss, avg_phys_loss
+
+    @torch.no_grad()
+    def eval_data_loss(
+        self,
+        loader: DataLoader,
+        seed: int,
+        num_batches: Optional[int],
+    ) -> float:
+        """Evaluate canonical conditional noise-prediction MSE.
+
+        This is the cross-stage MLflow ``data_loss`` metric. It intentionally
+        uses an ordered loader and a private CPU RNG, so evaluating it does not
+        perturb training randomness and a loaded checkpoint reproduces the
+        same value at PIDM epoch 0.
+        """
+        if num_batches is not None and num_batches <= 0:
+            raise ValueError("num_batches must be positive or None")
+
+        self.model.eval()
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(seed))
+        squared_error = 0.0
+        elements = 0
+
+        for batch_idx, (_, x0, _, _, cond, _) in enumerate(loader):
+            if num_batches is not None and batch_idx >= num_batches:
+                break
+
+            x0 = x0.to(self.device)
+            cond = cond.to(self.device)
+            batch_size = x0.size(0)
+            t = torch.randint(
+                0,
+                self.cfg.T,
+                (batch_size,),
+                generator=generator,
+                device="cpu",
+                dtype=torch.long,
+            ).to(self.device)
+            noise = torch.randn(
+                x0.shape,
+                generator=generator,
+                device="cpu",
+                dtype=x0.dtype,
+            ).to(self.device)
+            x_t = self.q_sample(x0, t, noise)
+            eps_pred = self.model(x_t, t, cond)
+            squared_error += float(
+                F.mse_loss(eps_pred, noise, reduction="sum").item()
+            )
+            elements += noise.numel()
+
+        if elements == 0:
+            raise ValueError("data-loss evaluation loader produced no examples")
+        return squared_error / elements
 
     @torch.no_grad()
     def eval_recon_mse(self, loader: DataLoader, num_batches: int = 2) -> float:
@@ -649,7 +631,11 @@ def run_training(
     print(f"CHECKPOINT LOCATION")
     print(f"{'='*60}")
     print(f"Checkpoint directory: {os.path.abspath(out_dir)}")
-    print(f"Checkpoint file: {os.path.abspath(ckpt_path)}")
+    print(f"Best checkpoint: {os.path.abspath(ckpt_path)}")
+    print(
+        "Final PIDM handoff checkpoint: "
+        f"{os.path.abspath(os.path.join(out_dir, 'conditional.pt'))}"
+    )
     print(f"{'='*60}\n")
 
     # Convert data to torch
@@ -678,12 +664,14 @@ def run_training(
     cfg = DiffusionConfig(
         T=1000,
         beta_schedule="cosine",
+        emb_dim=256,
+        base_ch=64,
         drop_prob=0,
         lr=2e-4,
         batch_size=64,
         num_workers=0,  # Set to 0 for macOS compatibility (multiprocessing issues)
         grad_clip=1.0,
-        epochs=10,
+        epochs=30,
         guidance_scale=1.0,
         use_amp=True,
     )
@@ -696,6 +684,14 @@ def run_training(
         pin_memory=(device.type == "cuda"),
         drop_last=True,
     )
+    data_loss_loader = DataLoader(
+        train_ds,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
     test_loader = DataLoader(
         test_ds,
         batch_size=cfg.batch_size,
@@ -705,7 +701,7 @@ def run_training(
         drop_last=False,
     )
 
-    model = ConditionalDDPM(T=cfg.T, emb_dim=256, base_ch=64)
+    model = ConditionalDDPM(T=cfg.T, emb_dim=cfg.emb_dim, base_ch=cfg.base_ch)
     trainer = DDPMTrainer(model, cfg, device, data_mean=train_mean, data_std=train_std)
 
     ckpt_path = os.path.join(out_dir, "best.pt")
@@ -718,16 +714,23 @@ def run_training(
     print(f"Epochs: {cfg.epochs}")
     print(f"Device: {device}")
     print(f"Checkpoint directory: {os.path.abspath(out_dir)}")
-    print(f"Checkpoint will be saved to: {os.path.abspath(ckpt_path)}")
+    print(f"Best checkpoint will be saved to: {os.path.abspath(ckpt_path)}")
+    print(
+        "Final PIDM handoff will be saved to: "
+        f"{os.path.abspath(os.path.join(out_dir, 'conditional.pt'))}"
+    )
     print(f"{'='*60}\n")
 
     best_test = float("inf")
 
     # ---- MLflow setup ----
-    mlflow.set_tracking_uri(f"file:{out_dir}/mlruns")  # simplest: store runs next to your checkpoints
+    mlflow.set_tracking_uri(
+        f"file:{os.path.abspath(os.path.join(out_dir, 'mlruns'))}"
+    )
     mlflow.set_experiment("conditional_ddpm_2dns")
 
     with mlflow.start_run(run_name="cfg_conditional_ddpm"):
+        active_run_id = mlflow.active_run().info.run_id
         # log hyperparameters
         mlflow.log_params(cfg.__dict__)
         mlflow.log_param("seed", seed)
@@ -739,6 +742,11 @@ def run_training(
         for epoch in range(1, cfg.epochs + 1):
             t0 = time.time()
             train_loss, train_loss_data, train_loss_physics = trainer.train_one_epoch(train_loader, epoch)
+            data_loss = trainer.eval_data_loss(
+                data_loss_loader,
+                seed=cfg.data_loss_eval_seed,
+                num_batches=cfg.data_loss_eval_batches,
+            )
             
             ckpt = {
                 "model": trainer.model.state_dict(),
@@ -748,6 +756,9 @@ def run_training(
                 "last_epoch": epoch,
                 "optimizer": trainer.opt.state_dict(),
                 "scaler": trainer.scaler.state_dict(),
+                "data_loss": data_loss,
+                "mlflow_run_id": active_run_id,
+                "checkpoint_kind": "last",
             }
             torch.save(ckpt, os.path.join(out_dir, "conditional.pt"))
             print("Saved conditional.pt (pre-eval).")
@@ -756,13 +767,16 @@ def run_training(
             dt = time.time() - t0
 
             mlflow.log_metric("train_loss", float(train_loss), step=epoch)
-            mlflow.log_metric("train_loss_data", float(train_loss_data), step=epoch)
+            mlflow.log_metric("optimization_data_loss", float(train_loss_data), step=epoch)
+            mlflow.log_metric("train_loss_data", float(data_loss), step=epoch)
+            mlflow.log_metric("data_loss", float(data_loss), step=epoch)
             mlflow.log_metric("train_loss_physics", float(train_loss_physics), step=epoch)
             mlflow.log_metric("test_recon_mse", float(test_mse), step=epoch)
 
             print(
                 f"Epoch {epoch:03d} | train_loss={train_loss:.6f} "
-                f"(data={train_loss_data:.6f}, phys={train_loss_physics:.6f}) | "
+                f"(stochastic_data={train_loss_data:.6f}, phys={train_loss_physics:.6f}) | "
+                f"data_loss={data_loss:.6f} | "
                 f"test_recon_mse~={test_mse:.6f} | {dt:.1f}s"
             )
 
@@ -782,6 +796,9 @@ def run_training(
                     "last_epoch": epoch,
                     "optimizer": trainer.opt.state_dict(),
                     "scaler": trainer.scaler.state_dict(),
+                    "data_loss": data_loss,
+                    "mlflow_run_id": active_run_id,
+                    "checkpoint_kind": "best",
                 }
                 ckpt_path = os.path.join(out_dir, "best.pt")
                 
@@ -814,6 +831,9 @@ def run_training(
             "last_epoch": cfg.epochs,
             "optimizer": trainer.opt.state_dict(),
             "scaler": trainer.scaler.state_dict(),
+            "data_loss": data_loss,
+            "mlflow_run_id": active_run_id,
+            "checkpoint_kind": "last",
         },
         last_ckpt_path,
     )
@@ -831,7 +851,9 @@ def run_training(
     else:
         print(f"WARNING: Last checkpoint not found at {last_ckpt_path}")
     
-    return final_ckpt_path, (train_mean, train_std), cfg
+    # The PIDM handoff must use the final epoch, not the validation-selected
+    # best checkpoint, whose weights may come from an earlier epoch.
+    return last_ckpt_path, (train_mean, train_std), cfg
 
 
 def _diffusion_config_from_ckpt(cfg_dict: Dict[str, Any]) -> DiffusionConfig:
@@ -907,6 +929,14 @@ def run_training_resume(
         pin_memory=(device.type == "cuda"),
         drop_last=True,
     )
+    data_loss_loader = DataLoader(
+        train_ds,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
     test_loader = DataLoader(
         test_ds,
         batch_size=cfg.batch_size,
@@ -916,8 +946,8 @@ def run_training_resume(
         drop_last=False,
     )
 
-    model = ConditionalDDPM(T=cfg.T, emb_dim=256, base_ch=64)
-    model.load_state_dict(ckpt["model"])
+    model = ConditionalDDPM(T=cfg.T, emb_dim=cfg.emb_dim, base_ch=cfg.base_ch)
+    model.load_state_dict(ckpt["model"], strict=True)
     trainer = DDPMTrainer(model, cfg, device, data_mean=train_mean, data_std=train_std)
 
     if "optimizer" in ckpt and ckpt["optimizer"] is not None:
@@ -971,6 +1001,11 @@ def run_training_resume(
             log_step = start_step + i
             t0 = time.time()
             train_loss, train_loss_data, train_loss_physics = trainer.train_one_epoch(train_loader, i)
+            data_loss = trainer.eval_data_loss(
+                data_loss_loader,
+                seed=cfg.data_loss_eval_seed,
+                num_batches=cfg.data_loss_eval_batches,
+            )
 
             payload = {
                 "model": trainer.model.state_dict(),
@@ -980,6 +1015,8 @@ def run_training_resume(
                 "last_epoch": log_step,
                 "optimizer": trainer.opt.state_dict(),
                 "scaler": trainer.scaler.state_dict() if hasattr(trainer.scaler, "state_dict") else None,
+                "data_loss": data_loss,
+                "checkpoint_kind": "last",
             }
             torch.save(payload, os.path.join(out_dir, "conditional.pt"))
 
@@ -987,13 +1024,16 @@ def run_training_resume(
             dt = time.time() - t0
 
             mlflow.log_metric("train_loss", float(train_loss), step=log_step)
-            mlflow.log_metric("train_loss_data", float(train_loss_data), step=log_step)
+            mlflow.log_metric("optimization_data_loss", float(train_loss_data), step=log_step)
+            mlflow.log_metric("train_loss_data", float(data_loss), step=log_step)
+            mlflow.log_metric("data_loss", float(data_loss), step=log_step)
             mlflow.log_metric("train_loss_physics", float(train_loss_physics), step=log_step)
             mlflow.log_metric("test_recon_mse", float(test_mse), step=log_step)
 
             print(
                 f"Epoch (resume {i}/{additional_epochs}) global_step={log_step} | "
-                f"train_loss={train_loss:.6f} (data={train_loss_data:.6f}, phys={train_loss_physics:.6f}) | "
+                f"train_loss={train_loss:.6f} (stochastic_data={train_loss_data:.6f}, phys={train_loss_physics:.6f}) | "
+                f"data_loss={data_loss:.6f} | "
                 f"test_recon_mse~={test_mse:.6f} | {dt:.1f}s"
             )
 
@@ -1002,7 +1042,9 @@ def run_training_resume(
 
             if test_mse < best_test:
                 best_test = test_mse
-                torch.save(payload, ckpt_best_path)
+                best_payload = dict(payload)
+                best_payload["checkpoint_kind"] = "best"
+                torch.save(best_payload, ckpt_best_path)
                 mlflow.log_artifact(os.path.join(out_dir, "conditional.pt"), artifact_path="checkpoints")
                 mlflow.log_artifact(ckpt_best_path, artifact_path="checkpoints")
                 print(f"  ✓ NEW BEST: {os.path.abspath(ckpt_best_path)}")
@@ -1016,6 +1058,8 @@ def run_training_resume(
             "last_epoch": start_step + additional_epochs,
             "optimizer": trainer.opt.state_dict(),
             "scaler": trainer.scaler.state_dict() if hasattr(trainer.scaler, "state_dict") else None,
+            "data_loss": data_loss,
+            "checkpoint_kind": "last",
         },
         os.path.join(out_dir, "conditional.pt"),
     )
@@ -1047,11 +1091,14 @@ def load_and_sample(
     cfg_dict = ckpt["cfg"]
     T = cfg_dict["T"]
 
-    model = ConditionalDDPM(T=T, emb_dim=256, base_ch=64).to(device)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
-
     cfg = _diffusion_config_from_ckpt(cfg_dict)
+    model = ConditionalDDPM(
+        T=T,
+        emb_dim=cfg.emb_dim,
+        base_ch=cfg.base_ch,
+    ).to(device)
+    model.load_state_dict(ckpt["model"], strict=True)
+    model.eval()
     trainer = DDPMTrainer(
         model, cfg, device,
         data_mean=float(ckpt["train_mean"]),
