@@ -40,7 +40,7 @@ except ImportError:  # Direct execution: python PIDM/train_extend.py
 # use best.pt here: it can represent an earlier epoch and break the epoch-30
 # data-loss handoff comparison.
 CHECKPOINT_PATH = Path(
-    "/content/drive/MyDrive/Lab/CondDiff/pure_diffusion/conditional.pt"
+    "/content/drive/MyDrive/Lab/CondDiff/pure_diffusion1/conditional.pt"
 )
 
 # Use the exact same ordered array that was passed to cfgConditional.py. The

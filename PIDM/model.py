@@ -108,6 +108,7 @@ def physics_mlflow_params(
         "physics_dt_phys": str(dt_phys),
         "physics_time_derivative": "3-point 2nd-order centered",
         "physics_diffusion_noise_coupling": "shared across k-1, k, k+1",
+        "physics_gradient_objective": "weighted PDE plus spatial/time smoothness",
         "physics_reynolds_number": str(reynolds_number),
         "physics_viscosity": str(viscosity),
         "physics_forcing": f"f=[sin({forcing_wavenumber}*y), 0]^T",
@@ -408,6 +409,9 @@ class DiffusionConfig:
     # Maximum weighted-physics/data-loss ratio after the warmup ramp.
     physics_loss_target_ratio: float = 1.0
     physics_loss_target_warmup_ratio: float = 0.8
+    # Protect the diffusion/data objective by projecting away only the
+    # component of the physics gradient that opposes the data gradient.
+    use_pcgrad: bool = True
     # Every batch uses exactly this many independently selected examples for
     # physics, with diffusion timesteps sampled uniformly from [0, t_max).
     physics_examples_per_batch: int = 16
@@ -748,6 +752,115 @@ class DDPMTrainer:
         )
         return physics_scale, physics_scale * loss_phys
 
+    @staticmethod
+    def combine_data_and_physics_gradients(
+        parameters,
+        data_gradients,
+        physics_gradients,
+        *,
+        gradient_scale: float = 1.0,
+        use_pcgrad: bool = True,
+    ):
+        """Combine scaled AMP gradients with data-priority PCGrad.
+
+        Diagnostics describe the gradients before projection and after
+        undoing ``gradient_scale``. The physics gradient is the complete
+        non-data objective: weighted PDE loss plus both smoothness terms.
+        """
+        if gradient_scale <= 0:
+            raise ValueError("gradient_scale must be positive")
+
+        reference = next(
+            (
+                gradient
+                for gradient in (*data_gradients, *physics_gradients)
+                if gradient is not None
+            ),
+            None,
+        )
+        if reference is None:
+            raise RuntimeError("Neither objective produced model gradients")
+
+        data_norm_sq = reference.new_zeros(())
+        physics_norm_sq = reference.new_zeros(())
+        gradient_dot = reference.new_zeros(())
+        for data_gradient, physics_gradient in zip(
+            data_gradients, physics_gradients
+        ):
+            if data_gradient is not None:
+                data_norm_sq = data_norm_sq + data_gradient.square().sum()
+            if physics_gradient is not None:
+                physics_norm_sq = (
+                    physics_norm_sq + physics_gradient.square().sum()
+                )
+            if data_gradient is not None and physics_gradient is not None:
+                gradient_dot = gradient_dot + (
+                    data_gradient * physics_gradient
+                ).sum()
+
+        has_both_gradients = bool(
+            data_norm_sq.detach().item() > 0.0
+            and physics_norm_sq.detach().item() > 0.0
+        )
+        if has_both_gradients:
+            cosine = gradient_dot / torch.sqrt(
+                data_norm_sq * physics_norm_sq
+            )
+            cosine_value = float(cosine.detach().item())
+        else:
+            cosine_value = 0.0
+
+        projection_applied = bool(
+            use_pcgrad
+            and has_both_gradients
+            and gradient_dot.detach().item() < 0.0
+        )
+        projection_coefficient = (
+            gradient_dot / data_norm_sq
+            if projection_applied
+            else reference.new_zeros(())
+        )
+
+        combined_gradients = []
+        for parameter, data_gradient, physics_gradient in zip(
+            parameters, data_gradients, physics_gradients
+        ):
+            if data_gradient is None and physics_gradient is None:
+                combined_gradients.append(None)
+                continue
+
+            if projection_applied and data_gradient is not None:
+                if physics_gradient is None:
+                    projected_physics = -projection_coefficient * data_gradient
+                else:
+                    projected_physics = (
+                        physics_gradient
+                        - projection_coefficient * data_gradient
+                    )
+            else:
+                projected_physics = physics_gradient
+
+            if data_gradient is None:
+                combined = projected_physics
+            elif projected_physics is None:
+                combined = data_gradient
+            else:
+                combined = data_gradient + projected_physics
+            combined_gradients.append(combined.detach())
+
+        inverse_scale = 1.0 / float(gradient_scale)
+        data_norm = float(torch.sqrt(data_norm_sq).detach().item()) * inverse_scale
+        physics_norm = (
+            float(torch.sqrt(physics_norm_sq).detach().item()) * inverse_scale
+        )
+        return (
+            combined_gradients,
+            data_norm,
+            physics_norm,
+            cosine_value,
+            projection_applied,
+        )
+
     def train_one_epoch(self, loader: DataLoader, epoch: int):
         self.model.train()
         total_loss = 0.0
@@ -757,8 +870,17 @@ class DDPMTrainer:
         total_phys_scale = 0.0
         total_smooth_space_loss = 0.0
         total_smooth_time_loss = 0.0
+        total_data_grad_norm = 0.0
+        total_physics_grad_norm = 0.0
+        total_gradient_cosine = 0.0
+        total_pcgrad_projection = 0.0
         n = 0
         num_batches = len(loader)
+        trainable_parameters = [
+            parameter
+            for parameter in self.model.parameters()
+            if parameter.requires_grad
+        ]
         lambda_smooth_space = 1e-7
         lambda_smooth_time = 2e-6
         physics_target_ratio_epoch = self.get_physics_target_ratio(
@@ -772,7 +894,8 @@ class DDPMTrainer:
             f"  Starting epoch {epoch} ({num_batches} batches) | "
             f"physics examples/batch={self.cfg.physics_examples_per_batch}, "
             f"t_phys in [0,{self.cfg.physics_t_max}), "
-            f"target ratio={physics_target_ratio_epoch:.6f}"
+            f"target ratio={physics_target_ratio_epoch:.6f}, "
+            f"PCGrad={'enabled' if self.cfg.use_pcgrad else 'disabled'}"
         )
 
         for batch_idx, (
@@ -976,19 +1099,50 @@ class DDPMTrainer:
 
                         print("=" * 80 + "\n")
 
-                loss = (
-                            loss_diff
-                            + weighted_phys
-                            + lambda_smooth_space * loss_smooth_space
-                            + lambda_smooth_time * loss_smooth_time
-                        )
+                physics_objective = (
+                    weighted_phys
+                    + lambda_smooth_space * loss_smooth_space
+                    + lambda_smooth_time * loss_smooth_time
+                )
+                loss = loss_diff + physics_objective
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     print(f"Skipping bad batch at batch {batch_idx + 1}")
                     print(f"  Diff: {loss_diff.item()} | Phys: {loss_phys.item()}")
                     continue
 
-            self.scaler.scale(loss).backward()
+            # Compute the two objectives separately so their norms and cosine
+            # are observable. GradScaler applies the same scale to both, so
+            # their cosine and PCGrad projection are unchanged by AMP.
+            data_gradients = torch.autograd.grad(
+                self.scaler.scale(loss_diff),
+                trainable_parameters,
+                retain_graph=True,
+                allow_unused=True,
+            )
+            physics_gradients = torch.autograd.grad(
+                self.scaler.scale(physics_objective),
+                trainable_parameters,
+                allow_unused=True,
+            )
+            (
+                combined_gradients,
+                data_grad_norm,
+                physics_grad_norm,
+                gradient_cosine,
+                projection_applied,
+            ) = self.combine_data_and_physics_gradients(
+                trainable_parameters,
+                data_gradients,
+                physics_gradients,
+                gradient_scale=self.scaler.get_scale(),
+                use_pcgrad=self.cfg.use_pcgrad,
+            )
+            for parameter, combined_gradient in zip(
+                trainable_parameters, combined_gradients
+            ):
+                parameter.grad = combined_gradient
+
             if self.cfg.grad_clip is not None:
                 self.scaler.unscale_(self.opt)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
@@ -1002,6 +1156,10 @@ class DDPMTrainer:
             total_phys_scale += float(physics_scale.item()) * B
             total_smooth_space_loss += float(loss_smooth_space.item()) * B
             total_smooth_time_loss += float(loss_smooth_time.item()) * B
+            total_data_grad_norm += data_grad_norm * B
+            total_physics_grad_norm += physics_grad_norm * B
+            total_gradient_cosine += gradient_cosine * B
+            total_pcgrad_projection += float(projection_applied) * B
             n += B
 
             if (batch_idx + 1) % max(1, num_batches // 10) == 0 or (batch_idx + 1) % 10 == 0:
@@ -1017,6 +1175,10 @@ class DDPMTrainer:
                         f"PhysScale: {physics_scale.item():.2e} | "
                         f"Space: {loss_smooth_space.item():.6f} | "
                         f"TimeAccel: {loss_smooth_time.item():.6f} | "
+                        f"GradData: {data_grad_norm:.3e} | "
+                        f"GradPhys: {physics_grad_norm:.3e} | "
+                        f"GradCos: {gradient_cosine:+.4f} | "
+                        f"PCGrad: {'yes' if projection_applied else 'no'} | "
                         #f"Avg Loss: {current_avg_loss:.6f} | "
                         f"Avg Diff: {current_avg_diff:.6f} | "
                         f"Avg Phys: {current_avg_phys:.6f} | "
@@ -1030,6 +1192,10 @@ class DDPMTrainer:
         avg_phys_scale = total_phys_scale / max(n, 1)
         avg_smooth_space_loss = total_smooth_space_loss / max(n, 1)
         avg_smooth_time_loss = total_smooth_time_loss / max(n, 1)
+        avg_data_grad_norm = total_data_grad_norm / max(n, 1)
+        avg_physics_grad_norm = total_physics_grad_norm / max(n, 1)
+        avg_gradient_cosine = total_gradient_cosine / max(n, 1)
+        pcgrad_projection_fraction = total_pcgrad_projection / max(n, 1)
         print(
             f"  Epoch {epoch} complete | Average Loss: {avg_loss:.6f} | "
             f"Average Diff: {avg_diff_loss:.6f} | Average Phys: {avg_phys_loss:.6f} | "
@@ -1037,6 +1203,13 @@ class DDPMTrainer:
             f"Average Phys Scale: {avg_phys_scale:.6e} | "
             f"Spatial nonsmoothness: {avg_smooth_space_loss:.6f} | "
             f"Time acceleration: {avg_smooth_time_loss:.6f}"
+        )
+        print(
+            "  Gradient diagnostics | "
+            f"Data norm: {avg_data_grad_norm:.6e} | "
+            f"Physics norm: {avg_physics_grad_norm:.6e} | "
+            f"Pre-projection cosine: {avg_gradient_cosine:+.6f} | "
+            f"PCGrad projection fraction: {pcgrad_projection_fraction:.3f}"
         )
         return (
             avg_loss,
@@ -1046,6 +1219,10 @@ class DDPMTrainer:
             avg_phys_scale,
             avg_smooth_space_loss,
             avg_smooth_time_loss,
+            avg_data_grad_norm,
+            avg_physics_grad_norm,
+            avg_gradient_cosine,
+            pcgrad_projection_fraction,
         )
 
     @torch.no_grad()
@@ -1265,9 +1442,19 @@ def run_training(
 
         for epoch in range(1, cfg.epochs + 1):
             t0 = time.time()
-            train_loss, train_loss_data, train_loss_physics, train_loss_physics_weighted, train_loss_physics_scale, train_loss_spatial_nonsmoothness, train_loss_time_acceleration = (
-                trainer.train_one_epoch(train_loader, epoch)
-            )
+            (
+                train_loss,
+                train_loss_data,
+                train_loss_physics,
+                train_loss_physics_weighted,
+                train_loss_physics_scale,
+                train_loss_spatial_nonsmoothness,
+                train_loss_time_acceleration,
+                train_grad_data_norm,
+                train_grad_physics_norm,
+                train_grad_cosine,
+                train_pcgrad_projection_fraction,
+            ) = trainer.train_one_epoch(train_loader, epoch)
             data_loss = trainer.eval_data_loss(
                 data_loss_loader,
                 seed=cfg.data_loss_eval_seed,
@@ -1311,6 +1498,14 @@ def run_training(
             )
             mlflow.log_metric("train_loss_spatial_nonsmoothness", float(train_loss_spatial_nonsmoothness), step=epoch)
             mlflow.log_metric("train_loss_time_acceleration", float(train_loss_time_acceleration), step=epoch)
+            mlflow.log_metric("train_grad_data_norm", float(train_grad_data_norm), step=epoch)
+            mlflow.log_metric("train_grad_physics_norm", float(train_grad_physics_norm), step=epoch)
+            mlflow.log_metric("train_grad_cosine", float(train_grad_cosine), step=epoch)
+            mlflow.log_metric(
+                "train_pcgrad_projection_fraction",
+                float(train_pcgrad_projection_fraction),
+                step=epoch,
+            )
             mlflow.log_metric("test_recon_mse", float(test_mse), step=epoch)
 
             print(
@@ -1319,7 +1514,11 @@ def run_training(
                 f"weighted_phys={train_loss_physics_weighted:.6f}, "
                 f"phys_scale={train_loss_physics_scale:.2e}, "
                 f"space={train_loss_spatial_nonsmoothness:.6f}, "
-                f"time_accel={train_loss_time_acceleration:.6f}) | "
+                f"time_accel={train_loss_time_acceleration:.6f}, "
+                f"grad_data={train_grad_data_norm:.3e}, "
+                f"grad_phys={train_grad_physics_norm:.3e}, "
+                f"grad_cos={train_grad_cosine:+.4f}, "
+                f"pcgrad_frac={train_pcgrad_projection_fraction:.3f}) | "
                 f"data_loss={data_loss:.6f} | "
                 f"test_recon_mse~={test_mse:.6f} | {dt:.1f}s"
             )
@@ -1575,6 +1774,7 @@ def run_training_resume(
         f"auto_scale={cfg.auto_scale_physics}, "
         f"target_ratio_max={cfg.physics_loss_target_ratio}, "
         f"target_warmup={cfg.physics_loss_target_warmup_ratio}, "
+        f"PCGrad={'enabled' if cfg.use_pcgrad else 'disabled'}, "
         f"physics_examples/batch={cfg.physics_examples_per_batch}, "
         f"t_phys=[0,{cfg.physics_t_max})"
     )
@@ -1754,6 +1954,7 @@ def run_training_resume(
                 "physics_loss_target_warmup_ratio",
                 cfg.physics_loss_target_warmup_ratio,
             )
+            mlflow.log_param("use_pcgrad", cfg.use_pcgrad)
             log_physics_mlflow_params(
                 grid_size=64,
                 dt_phys=cfg.dt_phys,
@@ -1797,9 +1998,19 @@ def run_training_resume(
             global_step = start_step + i
             metric_step = metric_start_step + i
             t0 = time.time()
-            train_loss, train_loss_data, train_loss_physics, train_loss_physics_weighted, train_loss_physics_scale, train_loss_spatial_nonsmoothness, train_loss_time_acceleration = (
-                trainer.train_one_epoch(train_loader, i)
-            )
+            (
+                train_loss,
+                train_loss_data,
+                train_loss_physics,
+                train_loss_physics_weighted,
+                train_loss_physics_scale,
+                train_loss_spatial_nonsmoothness,
+                train_loss_time_acceleration,
+                train_grad_data_norm,
+                train_grad_physics_norm,
+                train_grad_cosine,
+                train_pcgrad_projection_fraction,
+            ) = trainer.train_one_epoch(train_loader, i)
             data_loss = trainer.eval_data_loss(
                 data_loss_loader,
                 seed=cfg.data_loss_eval_seed,
@@ -1843,6 +2054,14 @@ def run_training_resume(
             )
             mlflow.log_metric("train_loss_spatial_nonsmoothness", float(train_loss_spatial_nonsmoothness), step=metric_step)
             mlflow.log_metric("train_loss_time_acceleration", float(train_loss_time_acceleration), step=metric_step)
+            mlflow.log_metric("train_grad_data_norm", float(train_grad_data_norm), step=metric_step)
+            mlflow.log_metric("train_grad_physics_norm", float(train_grad_physics_norm), step=metric_step)
+            mlflow.log_metric("train_grad_cosine", float(train_grad_cosine), step=metric_step)
+            mlflow.log_metric(
+                "train_pcgrad_projection_fraction",
+                float(train_pcgrad_projection_fraction),
+                step=metric_step,
+            )
             mlflow.log_metric("test_recon_mse", float(test_mse), step=metric_step)
             mlflow.log_metric("pidm_epoch", float(i), step=metric_step)
 
@@ -1853,7 +2072,11 @@ def run_training_resume(
                 f"weighted_phys={train_loss_physics_weighted:.6f}, "
                 f"phys_scale={train_loss_physics_scale:.2e}, "
                 f"space={train_loss_spatial_nonsmoothness:.6f}, "
-                f"time_accel={train_loss_time_acceleration:.6f}) | "
+                f"time_accel={train_loss_time_acceleration:.6f}, "
+                f"grad_data={train_grad_data_norm:.3e}, "
+                f"grad_phys={train_grad_physics_norm:.3e}, "
+                f"grad_cos={train_grad_cosine:+.4f}, "
+                f"pcgrad_frac={train_pcgrad_projection_fraction:.3f}) | "
                 f"data_loss={data_loss:.6f} | "
                 f"test_recon_mse~={test_mse:.6f} | {dt:.1f}s"
             )
