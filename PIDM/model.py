@@ -1661,18 +1661,31 @@ def run_training_resume(
         num_batches=cfg.data_loss_eval_batches,
     )
     expected_data_loss = ckpt.get("data_loss")
-    if expected_data_loss is not None and not math.isclose(
-        epoch_zero_data_loss,
-        float(expected_data_loss),
-        rel_tol=1e-5,
-        abs_tol=1e-7,
-    ):
-        raise ValueError(
-            "PIDM epoch-0 data_loss does not match the source checkpoint: "
-            f"computed={epoch_zero_data_loss:.10g}, "
-            f"checkpoint={float(expected_data_loss):.10g}. "
-            "Use the same data/order and the final cfgConditional "
-            "conditional.pt checkpoint."
+    if expected_data_loss is not None:
+        expected_data_loss = float(expected_data_loss)
+        handoff_abs_error = abs(epoch_zero_data_loss - expected_data_loss)
+        print(
+            "Data-loss handoff check | "
+            f"checkpoint={expected_data_loss:.10g} | "
+            f"PIDM recomputed={epoch_zero_data_loss:.10g} | "
+            f"abs_error={handoff_abs_error:.3e}"
+        )
+        if not math.isclose(
+            epoch_zero_data_loss,
+            expected_data_loss,
+            rel_tol=1e-5,
+            abs_tol=1e-7,
+        ):
+            raise ValueError(
+                "PIDM epoch-0 data_loss does not match the source checkpoint. "
+                "Use the same data/order and the final cfgConditional "
+                "conditional.pt checkpoint."
+            )
+    else:
+        handoff_abs_error = None
+        print(
+            "Data-loss handoff check | checkpoint has no stored data_loss | "
+            f"PIDM recomputed={epoch_zero_data_loss:.10g}"
         )
 
     mlflow_uri = f"file:{resolved_mlflow_dir}"
@@ -1745,14 +1758,9 @@ def run_training_resume(
                 forcing_wavenumber=cfg.forcing_wavenumber,
             )
 
-        # Log the checkpoint value after independently verifying it. This
-        # preserves bit-for-bit MLflow equality across devices while still
-        # catching a wrong dataset/checkpoint before the first optimizer step.
-        data_loss = (
-            float(expected_data_loss)
-            if expected_data_loss is not None
-            else epoch_zero_data_loss
-        )
+        # Epoch 0 always reports PIDM's independent calculation. The stored
+        # checkpoint value is only a reference for the handoff check above.
+        data_loss = epoch_zero_data_loss
         mlflow.log_metric(
             "data_loss", float(data_loss), step=metric_start_step
         )
@@ -1765,11 +1773,17 @@ def run_training_resume(
             float(epoch_zero_data_loss),
             step=metric_start_step,
         )
-        mlflow.log_metric(
-            "data_loss_handoff_abs_error",
-            abs(float(epoch_zero_data_loss) - float(data_loss)),
-            step=metric_start_step,
-        )
+        if expected_data_loss is not None:
+            mlflow.log_metric(
+                "data_loss_checkpoint",
+                expected_data_loss,
+                step=metric_start_step,
+            )
+            mlflow.log_metric(
+                "data_loss_handoff_abs_error",
+                handoff_abs_error,
+                step=metric_start_step,
+            )
         print(
             f"PIDM epoch 0 | global_epoch={start_step} | "
             f"data_loss={data_loss:.6f}"
