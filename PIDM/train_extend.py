@@ -71,6 +71,7 @@ DT_PHYS = KOLMOGOROV_DT_PHYS
 REYNOLDS_NUMBER = KOLMOGOROV_REYNOLDS_NUMBER
 VISCOSITY = KOLMOGOROV_VISCOSITY
 FORCING_WAVENUMBER = KOLMOGOROV_FORCING_WAVENUMBER
+PHYSICS_T_MAX = 300  # Example value, adjust as needed
 
 # Physics is enabled through adaptive scaling in model.py.
 AUTO_SCALE_PHYSICS = True
@@ -117,6 +118,7 @@ def main() -> None:
         additional_epochs=ADDITIONAL_EPOCHS,
         mlflow_dir=str(MLFLOW_DIR),
         mlflow_run_id=MLFLOW_RUN_ID,
+        physics_t_max=PHYSICS_T_MAX,
         seed=SEED,
         epoch_offset=EPOCH_OFFSET,
         restore_optimizer=RESTORE_OPTIMIZER,
