@@ -71,7 +71,7 @@ DT_PHYS = KOLMOGOROV_DT_PHYS
 REYNOLDS_NUMBER = KOLMOGOROV_REYNOLDS_NUMBER
 VISCOSITY = KOLMOGOROV_VISCOSITY
 FORCING_WAVENUMBER = KOLMOGOROV_FORCING_WAVENUMBER
-PHYSICS_T_MAX = 300  # Example value, adjust as needed
+PHYSICS_T_MAX = 100  # Example value, adjust as needed
 
 # Physics is enabled through adaptive scaling in model.py.
 AUTO_SCALE_PHYSICS = True

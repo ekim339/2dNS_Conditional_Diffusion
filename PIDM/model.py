@@ -107,6 +107,7 @@ def physics_mlflow_params(
         "physics_forcing_grid_spacing": str(domain_length / (grid_size - 1)),
         "physics_dt_phys": str(dt_phys),
         "physics_time_derivative": "3-point 2nd-order centered",
+        "physics_diffusion_noise_coupling": "shared across k-1, k, k+1",
         "physics_reynolds_number": str(reynolds_number),
         "physics_viscosity": str(viscosity),
         "physics_forcing": f"f=[sin({forcing_wavenumber}*y), 0]^T",
@@ -839,8 +840,12 @@ class DDPMTrainer:
                     dtype=torch.long,
                 )
 
-                center_noise = torch.randn_like(x0[idx_phys])
-                x_t_phys = self.q_sample(x0[idx_phys], t_phys, center_noise)
+                # Couple the forward-diffusion perturbation across the three
+                # physical frames. Each frame retains the correct q(x_t|x_0)
+                # marginal, while shared noise prevents independent denoising
+                # errors from being amplified by the 1/(2*dt) time derivative.
+                physics_noise = torch.randn_like(x0[idx_phys])
+                x_t_phys = self.q_sample(x0[idx_phys], t_phys, physics_noise)
                 sqrt_acp_phys = extract(
                     self.sqrt_alphas_cumprod, t_phys, x_t_phys.shape
                 )
@@ -857,9 +862,8 @@ class DDPMTrainer:
 
                 def predict_clean_neighbor(field, field_cond):
                     selected_field = field[idx_phys]
-                    neighbor_noise = torch.randn_like(selected_field)
                     neighbor_noisy = self.q_sample(
-                        selected_field, t_phys, neighbor_noise
+                        selected_field, t_phys, physics_noise
                     )
                     neighbor_eps = self.model(
                         neighbor_noisy, t_phys, field_cond[idx_phys]
