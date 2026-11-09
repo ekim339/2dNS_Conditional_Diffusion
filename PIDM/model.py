@@ -9,9 +9,9 @@
 # - Splits first 80% train, last 20% test.
 # - Sparse 8x8 observations on a fixed grid (stride=8) + binary mask condition.
 # - Trains conditional DDPM with optional CFG dropout.
-# - Physics loss: predict vorticity at k-1, k, and k+1 and penalize a
-#   three-frame centered time derivative plus the repository pseudo-spectral
-#   RHS.
+# - Physics loss: predict vorticity at k-1, k, and k+1 and penalize the
+#   three-frame temporal weak-form (WSINDy) balance of the repository
+#   pseudo-spectral equation.
 #
 # Notes:
 # - U-Net input: cat([x_t, sparse_field, mask], dim=1) -> 3 channels.
@@ -97,16 +97,19 @@ def physics_mlflow_params(
     viscosity: float = KOLMOGOROV_VISCOSITY,
     forcing_wavenumber: int = KOLMOGOROV_FORCING_WAVENUMBER,
 ) -> Dict[str, str]:
-    """Repository PDE settings plus the PIDM training time stencil."""
+    """Repository PDE settings plus the PIDM temporal weak-form stencil."""
     domain_length = 2.0 * math.pi
     return {
-        "physics_residual": "domega_dt - repository_pseudospectral_rhs",
+        "physics_residual": "three-frame temporal weak-form SINDy balance",
         "physics_domain": "[0,2*pi]^2 periodic",
         "physics_grid_size": str(grid_size),
         "physics_fft_dx": str(domain_length / grid_size),
         "physics_forcing_grid_spacing": str(domain_length / (grid_size - 1)),
         "physics_dt_phys": str(dt_phys),
-        "physics_time_derivative": "3-point 2nd-order centered",
+        "physics_time_derivative": "integrated by parts (no pointwise derivative)",
+        "physics_temporal_window": "k-1, k, k+1",
+        "physics_temporal_test_function": "constant on [t_{k-1},t_{k+1}]",
+        "physics_temporal_quadrature": "3-point Simpson",
         "physics_diffusion_noise_coupling": "shared across k-1, k, k+1",
         "physics_gradient_objective": "weighted PDE plus spatial/time smoothness",
         "physics_reynolds_number": str(reynolds_number),
@@ -414,7 +417,7 @@ class DiffusionConfig:
     use_pcgrad: bool = True
     # Every batch uses exactly this many independently selected examples for
     # physics, with diffusion timesteps sampled uniformly from [0, t_max).
-    physics_examples_per_batch: int = 16
+    physics_examples_per_batch: int = 32
     physics_t_max: int = 100
     physics_scale_epsilon: float = 1e-12
     dt_phys: float = KOLMOGOROV_DT_PHYS
@@ -461,6 +464,8 @@ class DDPMTrainer:
             )
         if cfg.physics_scale_epsilon <= 0:
             raise ValueError("physics_scale_epsilon must be positive")
+        if cfg.dt_phys <= 0:
+            raise ValueError("dt_phys must be positive")
         if cfg.reynolds_number <= 0:
             raise ValueError("reynolds_number must be positive")
         expected_viscosity = 1.0 / cfg.reynolds_number
@@ -566,14 +571,19 @@ class DDPMTrainer:
         omega_k_plus_1: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Three-frame centered-time residual:
+        Three-frame temporal weak-form (WSINDy) residual.
 
-            R = dω/dt - PseudoSpectralNavierStokes2D_RHS(ω_k)
+        With the constant temporal test function on
+        ``[t_{k-1}, t_{k+1}]``, integration by parts gives
 
-        dω/dt uses the second-order centered stencil
-        (ω_{k+1} - ω_{k-1}) / (2*dt). Spatial terms use the evaluator's
-        rfft2/irfft2 mesh, stream-function velocity, nonlinear product,
-        forcing construction, and diffusion.
+            ω_{k+1} - ω_{k-1} = ∫ RHS(ω(t)) dt.
+
+        The RHS integral is evaluated with three-point Simpson quadrature.
+        Dividing the resulting balance by the window width ``2*dt`` keeps the
+        residual in the same units as the PDE while avoiding a pointwise time
+        derivative of the predicted fields. Spatial terms at every frame use
+        the evaluator's rfft2/irfft2 mesh, stream-function velocity,
+        nonlinear product, forcing construction, and diffusion.
         """
         fields = (
             omega_k_minus_1,
@@ -599,8 +609,17 @@ class DDPMTrainer:
         ):
             raise ValueError("All three vorticity fields must have the same shape")
 
-        d_omega_dt = (w_plus_1 - w_minus_1) / (2.0 * self.dt)
-        residual = d_omega_dt - self._repository_rhs(w_cur)
+        rhs_minus_1, rhs_cur, rhs_plus_1 = self._repository_rhs(
+            torch.cat((w_minus_1, w_cur, w_plus_1), dim=0)
+        ).chunk(3, dim=0)
+
+        # Simpson's rule over [t_{k-1}, t_{k+1}], whose subinterval width is
+        # dt: integral RHS dt ~= (dt / 3) * (RHS_{k-1} + 4 RHS_k + RHS_{k+1}).
+        integrated_rhs = (self.dt / 3.0) * (
+            rhs_minus_1 + 4.0 * rhs_cur + rhs_plus_1
+        )
+        weak_balance = w_plus_1 - w_minus_1 - integrated_rhs
+        residual = weak_balance / (2.0 * self.dt)
         return residual.unsqueeze(1)
 
     def p_mean_variance(self, x_t: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -966,7 +985,8 @@ class DDPMTrainer:
                 # Couple the forward-diffusion perturbation across the three
                 # physical frames. Each frame retains the correct q(x_t|x_0)
                 # marginal, while shared noise prevents independent denoising
-                # errors from being amplified by the 1/(2*dt) time derivative.
+                # errors from being amplified when the weak balance is
+                # normalized by its 2*dt integration-window width.
                 physics_noise = torch.randn_like(x0[idx_phys])
                 x_t_phys = self.q_sample(x0[idx_phys], t_phys, physics_noise)
                 sqrt_acp_phys = extract(
