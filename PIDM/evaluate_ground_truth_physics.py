@@ -1,4 +1,4 @@
-"""Evaluate the PIDM three-frame residual on ground-truth vorticity.
+"""Evaluate the PIDM five-frame weak residual on ground-truth vorticity.
 
 This script does not load or run a diffusion model. It reuses the exact
 ``DDPMTrainer.pde_residual`` implementation used during PIDM training and
@@ -11,8 +11,7 @@ Run with the same array used for training:
 
 By default the script evaluates every valid five-frame center in the first
 80 percent of the trajectory, matching the PIDM training split and center
-eligibility. Only the center and its immediate neighbors are used by the
-three-frame residual.
+eligibility. All five frames are used by the temporal weak residual.
 """
 
 from __future__ import annotations
@@ -67,8 +66,7 @@ def _select_centers(
     max_windows: Optional[int],
     seed: int,
 ) -> np.ndarray:
-    # PIDM's dataset admits centers 2, ..., frame_count - 3 because the public
-    # dataset carries five frames, even though this residual uses only k-1:k+1.
+    # PIDM's five-frame residual admits centers 2, ..., frame_count - 3.
     valid_centers = np.arange(2, frame_count - 2, dtype=np.int64)
     if valid_centers.size == 0:
         raise ValueError(
@@ -156,6 +154,9 @@ def evaluate_ground_truth_physics(
 
             # Copy from the possibly read-only memory map before creating
             # tensors, then evaluate in float32 exactly as PIDM training does.
+            omega_minus_2 = torch.from_numpy(
+                np.array(fields[center_batch - 2], dtype=np.float32, copy=True)
+            ).unsqueeze(1).to(eval_device)
             omega_minus_1 = torch.from_numpy(
                 np.array(fields[center_batch - 1], dtype=np.float32, copy=True)
             ).unsqueeze(1).to(eval_device)
@@ -165,16 +166,22 @@ def evaluate_ground_truth_physics(
             omega_plus_1 = torch.from_numpy(
                 np.array(fields[center_batch + 1], dtype=np.float32, copy=True)
             ).unsqueeze(1).to(eval_device)
+            omega_plus_2 = torch.from_numpy(
+                np.array(fields[center_batch + 2], dtype=np.float32, copy=True)
+            ).unsqueeze(1).to(eval_device)
 
             temporal_derivative = (
-                omega_plus_1 - omega_minus_1
-            ) / (2.0 * dt)
+                omega_plus_2 - omega_minus_2
+            ) / (4.0 * dt)
             residual = residual_evaluator.pde_residual(
+                omega_minus_2,
                 omega_minus_1,
                 omega,
                 omega_plus_1,
+                omega_plus_2,
             )
-            # pde_residual defines residual = temporal_derivative - RHS.
+            # The five-frame weak residual is the boundary-change rate minus
+            # the composite-Simpson time average of the spatial RHS.
             rhs = temporal_derivative - residual
 
             temporal_sq_sum += temporal_derivative.double().square().sum().item()
@@ -186,7 +193,7 @@ def evaluate_ground_truth_physics(
     rhs_mse = rhs_sq_sum / point_count
     residual_mse = residual_sq_sum / point_count
     metrics = {
-        "gt_physics_loss_3frame": residual_mse,
+        "gt_physics_loss_5frame": residual_mse,
         "temporal_derivative_mse": temporal_mse,
         "rhs_mse": rhs_mse,
         "residual_mse": residual_mse,
@@ -196,7 +203,7 @@ def evaluate_ground_truth_physics(
     }
 
     print("\nGlobal element-weighted averages")
-    print(f"  gt_physics_loss_3frame:  {metrics['gt_physics_loss_3frame']:.9e}")
+    print(f"  gt_physics_loss_5frame:  {metrics['gt_physics_loss_5frame']:.9e}")
     print(f"  temporal_derivative_mse: {metrics['temporal_derivative_mse']:.9e}")
     print(f"  rhs_mse:                 {metrics['rhs_mse']:.9e}")
     print(f"  residual_mse:            {metrics['residual_mse']:.9e}")
@@ -207,7 +214,7 @@ def evaluate_ground_truth_physics(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate PIDM's exact three-frame residual on ground-truth "
+            "Evaluate PIDM's exact five-frame weak residual on ground-truth "
             "physical-space vorticity; no checkpoint is required."
         )
     )

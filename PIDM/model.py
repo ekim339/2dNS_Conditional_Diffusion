@@ -9,8 +9,8 @@
 # - Splits first 80% train, last 20% test.
 # - Sparse 8x8 observations on a fixed grid (stride=8) + binary mask condition.
 # - Trains conditional DDPM with optional CFG dropout.
-# - Physics loss: predict vorticity at k-1, k, and k+1 and penalize the
-#   three-frame temporal weak-form (WSINDy) balance of the repository
+# - Physics loss: predict vorticity from k-2 through k+2 and penalize the
+#   five-frame temporal weak-form (WSINDy) balance of the repository
 #   pseudo-spectral equation.
 #
 # Notes:
@@ -100,17 +100,17 @@ def physics_mlflow_params(
     """Repository PDE settings plus the PIDM temporal weak-form stencil."""
     domain_length = 2.0 * math.pi
     return {
-        "physics_residual": "three-frame temporal weak-form SINDy balance",
+        "physics_residual": "five-frame temporal weak-form SINDy balance",
         "physics_domain": "[0,2*pi]^2 periodic",
         "physics_grid_size": str(grid_size),
         "physics_fft_dx": str(domain_length / grid_size),
         "physics_forcing_grid_spacing": str(domain_length / (grid_size - 1)),
         "physics_dt_phys": str(dt_phys),
         "physics_time_derivative": "integrated by parts (no pointwise derivative)",
-        "physics_temporal_window": "k-1, k, k+1",
-        "physics_temporal_test_function": "constant on [t_{k-1},t_{k+1}]",
-        "physics_temporal_quadrature": "3-point Simpson",
-        "physics_diffusion_noise_coupling": "shared across k-1, k, k+1",
+        "physics_temporal_window": "k-2, k-1, k, k+1, k+2",
+        "physics_temporal_test_function": "constant on [t_{k-2},t_{k+2}]",
+        "physics_temporal_quadrature": "5-point composite Simpson",
+        "physics_diffusion_noise_coupling": "shared across k-2 through k+2",
         "physics_gradient_objective": "weighted PDE plus spatial/time smoothness",
         "physics_reynolds_number": str(reynolds_number),
         "physics_viscosity": str(viscosity),
@@ -156,8 +156,8 @@ class NavierStokesSparseDataset(Dataset):
 
         Returns the same five-frame window as cfgConditional.py so the
         canonical handoff data-loss samples remain identical. PIDM's physics
-        residual uses only the central three frames (k-1, k, k+1). The two
-        frames on each side are stacked so the public batch remains a six-tensor tuple:
+        residual uses all five frames (k-2, ..., k+2). The two frames on each
+        side are stacked so the public batch remains a six-tensor tuple:
         (omega_before, x0, omega_after, cond_before, cond, cond_after).
         """
         assert full_fields.ndim == 3 and full_fields.shape[1:] == (64, 64)
@@ -566,37 +566,42 @@ class DDPMTrainer:
 
     def pde_residual(
         self,
+        omega_k_minus_2: torch.Tensor,
         omega_k_minus_1: torch.Tensor,
         omega_k: torch.Tensor,
         omega_k_plus_1: torch.Tensor,
+        omega_k_plus_2: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Three-frame temporal weak-form (WSINDy) residual.
+        Five-frame temporal weak-form (WSINDy) residual.
 
         With the constant temporal test function on
-        ``[t_{k-1}, t_{k+1}]``, integration by parts gives
+        ``[t_{k-2}, t_{k+2}]``, integration by parts gives
 
-            ω_{k+1} - ω_{k-1} = ∫ RHS(ω(t)) dt.
+            ω_{k+2} - ω_{k-2} = ∫ RHS(ω(t)) dt.
 
-        The RHS integral is evaluated with three-point Simpson quadrature.
-        Dividing the resulting balance by the window width ``2*dt`` keeps the
-        residual in the same units as the PDE while avoiding a pointwise time
-        derivative of the predicted fields. Spatial terms at every frame use
-        the evaluator's rfft2/irfft2 mesh, stream-function velocity,
-        nonlinear product, forcing construction, and diffusion.
+        The RHS integral is evaluated with five-point composite Simpson
+        quadrature. Dividing the resulting balance by the window width
+        ``4*dt`` keeps the residual in the same units as the PDE while
+        avoiding a pointwise time derivative of the predicted fields. Spatial
+        terms at every frame use the evaluator's rfft2/irfft2 mesh,
+        stream-function velocity, nonlinear product, forcing construction,
+        and diffusion.
         """
         fields = (
+            omega_k_minus_2,
             omega_k_minus_1,
             omega_k,
             omega_k_plus_1,
+            omega_k_plus_2,
         )
         if any(field.ndim != 4 or field.shape[1] != 1 for field in fields):
             shapes = [tuple(field.shape) for field in fields]
             raise ValueError(
-                f"Expected three (B,1,H,W) vorticity tensors, got {shapes}"
+                f"Expected five (B,1,H,W) vorticity tensors, got {shapes}"
             )
 
-        w_minus_1, w_cur, w_plus_1 = (
+        w_minus_2, w_minus_1, w_cur, w_plus_1, w_plus_2 = (
             field.squeeze(1) for field in fields
         )
 
@@ -605,21 +610,34 @@ class DDPMTrainer:
             raise ValueError(f"Expected 64x64 vorticity fields, got {H}x{W}")
         if any(
             field.shape != w_cur.shape
-            for field in (w_minus_1, w_plus_1)
+            for field in (w_minus_2, w_minus_1, w_plus_1, w_plus_2)
         ):
-            raise ValueError("All three vorticity fields must have the same shape")
+            raise ValueError("All five vorticity fields must have the same shape")
 
-        rhs_minus_1, rhs_cur, rhs_plus_1 = self._repository_rhs(
-            torch.cat((w_minus_1, w_cur, w_plus_1), dim=0)
-        ).chunk(3, dim=0)
+        (
+            rhs_minus_2,
+            rhs_minus_1,
+            rhs_cur,
+            rhs_plus_1,
+            rhs_plus_2,
+        ) = self._repository_rhs(
+            torch.cat(
+                (w_minus_2, w_minus_1, w_cur, w_plus_1, w_plus_2),
+                dim=0,
+            )
+        ).chunk(5, dim=0)
 
-        # Simpson's rule over [t_{k-1}, t_{k+1}], whose subinterval width is
-        # dt: integral RHS dt ~= (dt / 3) * (RHS_{k-1} + 4 RHS_k + RHS_{k+1}).
+        # Composite Simpson's rule over [t_{k-2}, t_{k+2}], with uniform
+        # subinterval width dt and weights [1, 4, 2, 4, 1].
         integrated_rhs = (self.dt / 3.0) * (
-            rhs_minus_1 + 4.0 * rhs_cur + rhs_plus_1
+            rhs_minus_2
+            + 4.0 * rhs_minus_1
+            + 2.0 * rhs_cur
+            + 4.0 * rhs_plus_1
+            + rhs_plus_2
         )
-        weak_balance = w_plus_1 - w_minus_1 - integrated_rhs
-        residual = weak_balance / (2.0 * self.dt)
+        weak_balance = w_plus_2 - w_minus_2 - integrated_rhs
+        residual = weak_balance / (4.0 * self.dt)
         return residual.unsqueeze(1)
 
     def p_mean_variance(self, x_t: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -928,13 +946,15 @@ class DDPMTrainer:
             x0 = x0.to(self.device)
             cond = cond.to(self.device)
 
-            # Keep the five-frame dataset shape for CFG handoff/evaluator
-            # compatibility, but transfer only the three-frame stencil used by
-            # the PIDM residual.
+            # Use the complete five-frame window for the temporal weak form.
+            omega_minus_2 = omega_before[:, 0].to(self.device)
             omega_minus_1 = omega_before[:, 1].to(self.device)
             omega_plus_1 = omega_after[:, 0].to(self.device)
+            omega_plus_2 = omega_after[:, 1].to(self.device)
+            cond_minus_2 = cond_before[:, 0].to(self.device)
             cond_minus_1 = cond_before[:, 1].to(self.device)
             cond_plus_1 = cond_after[:, 0].to(self.device)
+            cond_plus_2 = cond_after[:, 1].to(self.device)
 
             B = x0.size(0)
             t = torch.randint(0, self.cfg.T, (B,), device=self.device, dtype=torch.long)
@@ -982,11 +1002,11 @@ class DDPMTrainer:
                     dtype=torch.long,
                 )
 
-                # Couple the forward-diffusion perturbation across the three
+                # Couple the forward-diffusion perturbation across all five
                 # physical frames. Each frame retains the correct q(x_t|x_0)
                 # marginal, while shared noise prevents independent denoising
                 # errors from being amplified when the weak balance is
-                # normalized by its 2*dt integration-window width.
+                # normalized by its 4*dt integration-window width.
                 physics_noise = torch.randn_like(x0[idx_phys])
                 x_t_phys = self.q_sample(x0[idx_phys], t_phys, physics_noise)
                 sqrt_acp_phys = extract(
@@ -1015,17 +1035,25 @@ class DDPMTrainer:
                         neighbor_noisy - sqrt_om_phys * neighbor_eps
                     ) / (sqrt_acp_phys + 1e-8)
 
+                x_minus_2_pred = predict_clean_neighbor(
+                    omega_minus_2, cond_minus_2
+                )
                 x_minus_1_pred = predict_clean_neighbor(
                     omega_minus_1, cond_minus_1
                 )
                 x_plus_1_pred = predict_clean_neighbor(
                     omega_plus_1, cond_plus_1
                 )
+                x_plus_2_pred = predict_clean_neighbor(
+                    omega_plus_2, cond_plus_2
+                )
 
                 scale = self.data_std + 1e-8
                 x0_phys = x0_pred * scale + self.data_mean
+                omega_minus_2_phys = x_minus_2_pred * scale + self.data_mean
                 omega_minus_1_phys = x_minus_1_pred * scale + self.data_mean
                 omega_plus_1_phys = x_plus_1_pred * scale + self.data_mean
+                omega_plus_2_phys = x_plus_2_pred * scale + self.data_mean
 
                 loss_smooth_space = self.spatial_smoothness_loss(x0_phys)
                 loss_smooth_time = self.temporal_second_difference_loss(
@@ -1037,9 +1065,11 @@ class DDPMTrainer:
                 # FFT operations stay in float32 even when network inference
                 # above uses AMP, matching the evaluator's spatial precision.
                 residual = self.pde_residual(
+                    omega_minus_2_phys.float(),
                     omega_minus_1_phys.float(),
                     x0_phys.float(),
                     omega_plus_1_phys.float(),
+                    omega_plus_2_phys.float(),
                 )
                 loss_phys = F.mse_loss(
                     residual, torch.zeros_like(residual)
@@ -1092,9 +1122,11 @@ class DDPMTrainer:
 
                         print("\nPrediction field stats:")
                         for name, w in [
+                            ("omega_minus_2_phys", omega_minus_2_phys),
                             ("omega_minus_1_phys", omega_minus_1_phys),
                             ("x0_phys", x0_phys),
                             ("omega_plus_1_phys", omega_plus_1_phys),
+                            ("omega_plus_2_phys", omega_plus_2_phys),
                         ]:
                             print(
                                 f"  {name}: "
@@ -1722,7 +1754,7 @@ def run_training_resume(
     - Reloads the compatible ConditionalDDPM model weights.
     - Reloads optimizer and GradScaler state when requested and compatible.
     - Uses `train_mean` / `train_std` from the checkpoint (same normalization as original run).
-    - Migrates the legacy config to the current three-frame physics objective.
+    - Migrates the legacy config to the current five-frame physics objective.
     - Overrides legacy PDE values with the Kolmogorov simulation settings passed
       to this function (defaults match kolmogorov_demo.ipynb).
     - Writes checkpoints to `out_dir` and MLflow tracking data to `mlflow_dir`.

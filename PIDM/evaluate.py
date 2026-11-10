@@ -1,13 +1,13 @@
-"""Evaluate PIDM reconstructions and their Kolmogorov-flow residual.
+"""Evaluate conditional-DDPM reconstructions and their Kolmogorov residual.
 
 For every selected center frame, the PIDM independently predicts the five
 consecutive vorticity fields from k-2 through k+2 from their sparse observations.
 The residual is computed only from those predictions. Ground-truth vorticity is
 used only for reconstruction metrics.
 
-The spatial right-hand side matches evaluate_continuous_2dns_kolmogorov.py and
-PseudoSpectralNavierStokes2D. The temporal derivative uses the reference
-evaluator's default five-point, fourth-order centered stencil.
+The spatial right-hand side and five-frame temporal weak form match
+``PIDM/model.py``. Composite Simpson quadrature integrates the RHS over the
+window, so no pointwise finite-difference derivative is used.
 """
 
 import argparse
@@ -46,7 +46,7 @@ FORCING_WAVENUMBER = 4
 
 
 class KolmogorovResidual:
-    """Repository-consistent residual for five predicted vorticity frames."""
+    """Five-frame temporal weak residual used by ``PIDM/model.py``."""
 
     def __init__(
         self,
@@ -171,7 +171,25 @@ class KolmogorovResidual:
         omega_k_plus_1: torch.Tensor,
         omega_k_plus_2: torch.Tensor,
     ) -> torch.Tensor:
-        """Return the five-point temporal residual centered at omega[k]."""
+        """Return the five-frame temporal weak residual."""
+        _, _, residual = self.components(
+            omega_k_minus_2,
+            omega_k_minus_1,
+            omega_k,
+            omega_k_plus_1,
+            omega_k_plus_2,
+        )
+        return residual
+
+    def components(
+        self,
+        omega_k_minus_2: torch.Tensor,
+        omega_k_minus_1: torch.Tensor,
+        omega_k: torch.Tensor,
+        omega_k_plus_1: torch.Tensor,
+        omega_k_plus_2: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return weak temporal rate, Simpson-averaged RHS, and residual."""
         fields = (
             omega_k_minus_2,
             omega_k_minus_1,
@@ -190,10 +208,29 @@ class KolmogorovResidual:
         w_minus_2, w_minus_1, w_cur, w_plus_1, w_plus_2 = (
             field.squeeze(1) for field in fields
         )
-        d_omega_dt = (
-            w_minus_2 - 8.0 * w_minus_1 + 8.0 * w_plus_1 - w_plus_2
-        ) / (12.0 * self.dt)
-        return d_omega_dt - self.repository_rhs(w_cur)
+        (
+            rhs_minus_2,
+            rhs_minus_1,
+            rhs_cur,
+            rhs_plus_1,
+            rhs_plus_2,
+        ) = self.repository_rhs(
+            torch.cat(
+                (w_minus_2, w_minus_1, w_cur, w_plus_1, w_plus_2),
+                dim=0,
+            )
+        ).chunk(5, dim=0)
+
+        temporal_rate = (w_plus_2 - w_minus_2) / (4.0 * self.dt)
+        rhs_time_average = (
+            rhs_minus_2
+            + 4.0 * rhs_minus_1
+            + 2.0 * rhs_cur
+            + 4.0 * rhs_plus_1
+            + rhs_plus_2
+        ) / 12.0
+        residual = temporal_rate - rhs_time_average
+        return temporal_rate, rhs_time_average, residual
 
 
 def _sample_subset(
@@ -229,6 +266,8 @@ def evaluate_on_test(
     field_points = 0
     sensor_sq_sum = 0.0
     sensor_points = 0.0
+    temporal_sq_sum = 0.0
+    rhs_sq_sum = 0.0
     residual_sq_sum = 0.0
     residual_sum = 0.0
     residual_abs_sum = 0.0
@@ -247,7 +286,8 @@ def evaluate_on_test(
         )
     )
     print("Residual input: five PIDM-predicted consecutive frames")
-    print("Time derivative: 5-point, 4th-order centered")
+    print("Temporal residual: five-frame weak form")
+    print("RHS quadrature: 5-point composite Simpson")
     print(
         f"dt={residual_evaluator.dt}, "
         f"Re={residual_evaluator.reynolds_number:g}, "
@@ -333,7 +373,7 @@ def evaluate_on_test(
         omega_plus_2_pred = omega_plus_2_pred_norm * scale + mean
 
         # The residual depends only on generated fields, never ground truth.
-        residual = residual_evaluator(
+        temporal_rate, rhs_time_average, residual = residual_evaluator.components(
             omega_minus_2_pred.float(),
             omega_minus_1_pred.float(),
             omega_pred.float(),
@@ -351,6 +391,8 @@ def evaluate_on_test(
         ).sum().item()
         sensor_points += mask.double().sum().item()
 
+        temporal_sq_sum += temporal_rate.double().square().sum().item()
+        rhs_sq_sum += rhs_time_average.double().square().sum().item()
         residual_double = residual.double()
         residual_sq_sum += residual_double.square().sum().item()
         residual_sum += residual_double.sum().item()
@@ -374,12 +416,17 @@ def evaluate_on_test(
         raise ValueError("No evaluation batches were processed")
 
     total_time = time.time() - start_time
+    temporal_mse = temporal_sq_sum / residual_points
+    rhs_mse = rhs_sq_sum / residual_points
     physics_mse = residual_sq_sum / residual_points
     metrics = {
         "mse": field_sq_sum / field_points,
         "mae": field_abs_sum / field_points,
         "sensor_mse": sensor_sq_sum / sensor_points,
+        "temporal_derivative_mse": temporal_mse,
+        "rhs_mse": rhs_mse,
         "physics_mse": physics_mse,
+        "residual_mse": physics_mse,
         "residual_rmse": math.sqrt(physics_mse),
         "residual_mean": residual_sum / residual_points,
         "residual_absmean": residual_abs_sum / residual_points,
@@ -390,6 +437,8 @@ def evaluate_on_test(
         "_residual_sq_sum": residual_sq_sum,
         "_residual_sum": residual_sum,
         "_residual_abs_sum": residual_abs_sum,
+        "_temporal_sq_sum": temporal_sq_sum,
+        "_rhs_sq_sum": rhs_sq_sum,
     }
 
     print(f"\n{'=' * 60}")
@@ -399,8 +448,10 @@ def evaluate_on_test(
     print(f"Full-field MSE:          {metrics['mse']:.9e}")
     print(f"Full-field MAE:          {metrics['mae']:.9e}")
     print(f"Sensor MSE:              {metrics['sensor_mse']:.9e}")
-    print(f"Physics MSE:             {metrics['physics_mse']:.9e}")
-    print(f"Residual RMSE:           {metrics['residual_rmse']:.9e}")
+    print(f"temporal_derivative_mse: {metrics['temporal_derivative_mse']:.9e}")
+    print(f"rhs_mse:                 {metrics['rhs_mse']:.9e}")
+    print(f"residual_mse:            {metrics['residual_mse']:.9e}")
+    print(f"residual_rmse:           {metrics['residual_rmse']:.9e}")
     print(f"Residual mean:           {metrics['residual_mean']:.9e}")
     print(f"Residual |mean|:         {metrics['residual_absmean']:.9e}")
     print(f"Residual |max|:          {metrics['residual_absmax']:.9e}")
@@ -559,6 +610,14 @@ def run_eval(
         train_metrics["_residual_sq_sum"]
         + test_metrics["_residual_sq_sum"]
     ) / residual_points
+    temporal_mse = (
+        train_metrics["_temporal_sq_sum"]
+        + test_metrics["_temporal_sq_sum"]
+    ) / residual_points
+    rhs_mse = (
+        train_metrics["_rhs_sq_sum"]
+        + test_metrics["_rhs_sq_sum"]
+    ) / residual_points
     residual_mean = (
         train_metrics["_residual_sum"] + test_metrics["_residual_sum"]
     ) / residual_points
@@ -577,7 +636,10 @@ def run_eval(
         "mse": sample_weighted("mse"),
         "mae": sample_weighted("mae"),
         "sensor_mse": sample_weighted("sensor_mse"),
+        "temporal_derivative_mse": temporal_mse,
+        "rhs_mse": rhs_mse,
         "physics_mse": physics_mse,
+        "residual_mse": physics_mse,
         "residual_rmse": math.sqrt(physics_mse),
         "residual_mean": residual_mean,
         "residual_absmean": residual_absmean,
@@ -595,8 +657,13 @@ def run_eval(
     print(f"Full-field MSE:  {combined_metrics['mse']:.9e}")
     print(f"Full-field MAE:  {combined_metrics['mae']:.9e}")
     print(f"Sensor MSE:      {combined_metrics['sensor_mse']:.9e}")
-    print(f"Physics MSE:     {combined_metrics['physics_mse']:.9e}")
-    print(f"Residual RMSE:   {combined_metrics['residual_rmse']:.9e}")
+    print(
+        "temporal_derivative_mse: "
+        f"{combined_metrics['temporal_derivative_mse']:.9e}"
+    )
+    print(f"rhs_mse:         {combined_metrics['rhs_mse']:.9e}")
+    print(f"residual_mse:    {combined_metrics['residual_mse']:.9e}")
+    print(f"residual_rmse:   {combined_metrics['residual_rmse']:.9e}")
     print(f"Residual mean:   {combined_metrics['residual_mean']:.9e}")
     print(f"Residual |mean|: {combined_metrics['residual_absmean']:.9e}")
     print(f"Residual |max|:  {combined_metrics['residual_absmax']:.9e}")
@@ -613,7 +680,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Evaluate PIDM reconstructions and the repository-consistent "
-            "Kolmogorov residual of five predicted frames."
+            "five-frame temporal weak Kolmogorov residual."
         )
     )
     parser.add_argument(
